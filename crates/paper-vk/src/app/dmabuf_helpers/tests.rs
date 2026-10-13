@@ -57,9 +57,9 @@ fn native_override_disables_automatic_reuse() {
 
 #[test]
 fn xr_transitions_keep_native_extents_for_mixed_output_sizes() {
-    assert_eq!(xr_render_dims(&OUTPUTS, Some((2560, 1440)), None, true), OUTPUTS);
+    assert_eq!(xr_render_dims(&OUTPUTS, Some((2560, 1440)), None, true, None), OUTPUTS);
     assert_eq!(
-        xr_render_dims(&[(2560, 1440); 3], Some((1920, 1080)), None, true),
+        xr_render_dims(&[(2560, 1440); 3], Some((1920, 1080)), None, true, None),
         vec![(1920, 1080); 3]
     );
 }
@@ -67,8 +67,33 @@ fn xr_transitions_keep_native_extents_for_mixed_output_sizes() {
 #[test]
 fn xr_transition_override_can_force_a_shared_extent() {
     assert_eq!(
-        xr_render_dims(&OUTPUTS, Some((2560, 1440)), Some("max"), true),
+        xr_render_dims(&OUTPUTS, Some((2560, 1440)), Some("max"), true, None),
         vec![(3840, 2160); 3]
+    );
+}
+
+#[test]
+fn span_preserves_desktop_aspect() {
+    assert_eq!(
+        xr_render_dims(&[(800, 600); 2], Some((1600, 900)), None, true, Some((1600, 600))),
+        vec![(1600, 600); 2]
+    );
+    assert_eq!(
+        xr_render_dims(&[(800, 600); 2], Some((800, 450)), None, true, Some((1600, 600))),
+        vec![(1600, 600); 2]
+    );
+}
+
+#[test]
+fn span_retains_output_layout() {
+    let outputs = [(800, 600), (600, 800)];
+    assert_eq!(
+        xr_render_dims(&outputs, Some((1920, 1080)), None, true, Some((1400, 800))),
+        vec![(1400, 800); 2]
+    );
+    assert_eq!(
+        xr_render_dims(&outputs, Some((1920, 1080)), None, false, Some((1400, 800))),
+        outputs
     );
 }
 

@@ -209,6 +209,7 @@ impl Group {
                 (scene, &*properties)
             }
         };
+        changed |= self.puppets.iter().any(|puppet| !puppet.pose.attachments.is_empty());
         if !changed && !std::mem::take(&mut scripts.pending) {
             return Ok(());
         }
@@ -217,11 +218,20 @@ impl Group {
                 self.apply_general(key, value);
             }
         }
+        let mut attachments = paper_scene::model::Attachments::new();
+        for puppet in &self.puppets {
+            for (attachment, pose) in
+                puppet.puppet.mesh.attachments.iter().zip(&puppet.pose.attachments)
+            {
+                attachments.entry((puppet.id.as_str(), attachment.name.as_str())).or_insert(*pose);
+            }
+        }
         let particle_states = paper_scene::model::script::particle_frames(
             scene,
             self.particles.iter().map(|group| group.id.as_str()),
             self.canvas,
             properties,
+            &attachments,
         );
         for (group, state) in self.particles.iter_mut().zip(particle_states) {
             if group.parent.is_some() {
@@ -233,7 +243,7 @@ impl Group {
                 group.visible = state.visible;
             }
         }
-        let mut states = frames(scene, &scripts.layouts, self.canvas, properties);
+        let mut states = frames(scene, &scripts.layouts, self.canvas, properties, &attachments);
         let mut text_layout_changed = false;
         for (index, slot, text) in &mut scripts.text {
             let Some(wanted) = states[*index].as_ref().and_then(|s| s.text.as_ref()) else {
@@ -259,7 +269,7 @@ impl Group {
             text_layout_changed = true;
         }
         if text_layout_changed {
-            states = frames(scene, &scripts.layouts, self.canvas, properties);
+            states = frames(scene, &scripts.layouts, self.canvas, properties, &attachments);
         }
         let objects = effect_objects(scene);
         for (index, state) in states.into_iter().enumerate() {

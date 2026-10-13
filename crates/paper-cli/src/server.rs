@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+const MIRROR_FAILED: &str = "mirror_failed";
 const MAX_REQUEST: u64 = 1024 * 1024;
 const START_IDLE: Duration = Duration::from_secs(5);
 const EMPTY_IDLE: Duration = Duration::from_millis(750);
@@ -78,6 +79,7 @@ enum Event {
 
 async fn serve(listener: StdUnixListener, path: &Path, mut manager: Manager) -> Result<()> {
     let listener = UnixListener::from_std(listener).context("register Paper listener")?;
+    paper_runtime::scratch::sweep();
     let started = Instant::now();
     let mut handled = false;
     let mut last_handled = None;
@@ -206,22 +208,31 @@ async fn handle(
             )
             .await
         }
-        RequestParams::Stop(stop) => match manager.stop(&stop).await {
-            Ok(stopped) => {
-                write_response(
-                    &mut stream,
-                    &StopResponse::success(request.id, StopResult { stopped }),
-                )
-                .await
+        RequestParams::Stop(stop) => {
+            match stop_assignment(manager, listener, socket, &stop).await {
+                Ok(stopped) => {
+                    write_response(
+                        &mut stream,
+                        &StopResponse::success(request.id, StopResult { stopped }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_response(
+                        &mut stream,
+                        &StopResponse::failure(request.id, "stop_failed", error.to_string()),
+                    )
+                    .await
+                }
             }
-            Err(error) => {
-                write_response(
-                    &mut stream,
-                    &StopResponse::failure(request.id, "stop_failed", error.to_string()),
-                )
-                .await
-            }
-        },
+        }
+        RequestParams::Mirror(target) => {
+            let response = match manager.mirror(&target).await {
+                Ok(()) => Response::success(request.id, target),
+                Err(error) => Response::failure(request.id, MIRROR_FAILED, error.to_string()),
+            };
+            write_response(&mut stream, &response).await
+        }
         RequestParams::Pause(pause) => {
             let transaction = if pause.paused {
                 manager.begin_pause(socket).await
@@ -324,6 +335,23 @@ async fn handle(
         }
         RequestParams::Ready(_) | RequestParams::Failed(_) => Ok(()),
     }
+}
+
+async fn stop_assignment(
+    manager: &mut Manager,
+    listener: &UnixListener,
+    socket: &Path,
+    request: &paper_control::StopRequest,
+) -> Result<usize> {
+    let Some((mut transaction, count)) = manager.begin_stop(request, socket).await? else {
+        return manager.stop(request).await;
+    };
+    if let Err(error) = wait_ready(listener, &mut transaction).await {
+        transaction.rollback().await;
+        return Err(error);
+    }
+    manager.commit(transaction).await?;
+    Ok(count)
 }
 
 fn apply_rejection_code(error: &anyhow::Error) -> &'static str {

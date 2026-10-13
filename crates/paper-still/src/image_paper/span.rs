@@ -93,6 +93,7 @@ impl App {
         surf.surface.damage_buffer(0, 0, bw as i32, bh as i32);
         surf.span_keepalive = Some(buffer);
         surf.attached = true;
+        surf.hide();
         surf.surface.commit();
         self.startup_readiness.committed(surf.output.id().protocol_id());
     }

@@ -455,7 +455,7 @@ fn response_goldens() {
             r#""video_engines":["default","tinier"],"#,
             r#""fill_modes":["fill","fit","stretch","center","tile","span"],"#,
             r#""layers":["background","bottom","top","overlay"],"#,
-            r#""controls":{"pause":true,"audio":true,"surface_effects":true},"#,
+            r#""controls":{"mirror":true,"pause":true,"audio":true,"surface_effects":true},"#,
             r#""transitions":{"startup_source_kinds":["video","we"],"#,
             r#""static_overlay":true,"default_effect":"fade","default_duration_ms":600,"#,
             r#""min_duration_ms":50,"max_duration_ms":10000},"#,
@@ -717,4 +717,33 @@ fn surface_control_is_validated_and_round_trips() {
         );
     }
     assert!(CapabilitiesResult::current().controls.surface_effects);
+}
+
+#[test]
+fn mirror_request_contract() {
+    let request = Request::new(
+        8,
+        RequestParams::Mirror(crate::MirrorTarget {
+            output: "DP-1".into(),
+            socket: "/run/lock.sock".into(),
+        }),
+    );
+    let wire = encode_ndjson(&request).unwrap();
+    assert_eq!(
+        wire,
+        "{\"id\":8,\"method\":\"paper.mirror\",\"params\":{\"output\":\"DP-1\",\"socket\":\"/run/lock.sock\"}}\n"
+    );
+    assert_eq!(decode_ndjson::<Request>(&wire).unwrap(), request);
+    assert!(request.validate().is_ok());
+    for (output, socket) in [("", "/run/lock.sock"), ("*", "/run/lock.sock"), ("DP-1", "relative")]
+    {
+        assert!(
+            crate::MirrorTarget { output: output.into(), socket: socket.into() }
+                .validate()
+                .is_err()
+        );
+    }
+    assert!(
+        crate::MirrorTarget { output: "DP-1".into(), socket: String::new() }.validate().is_ok()
+    );
 }

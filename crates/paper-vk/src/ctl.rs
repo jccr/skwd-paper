@@ -299,6 +299,10 @@ impl Ctl {
             return None;
         }
         match paper_control::classify_command(cmd) {
+            paper_control::CommandClass::Mirror(target) => {
+                crate::wayland::request_mirror(target);
+                None
+            }
             paper_control::CommandClass::Surface(surface) => {
                 if surface.validate().is_ok() {
                     crate::surface::set(&surface);

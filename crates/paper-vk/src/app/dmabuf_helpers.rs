@@ -423,7 +423,11 @@ pub(super) fn xr_render_dims(
     source: Option<(u32, u32)>,
     mode: Option<&str>,
     supported: bool,
+    span: Option<(u32, u32)>,
 ) -> Vec<(u32, u32)> {
+    if supported && let Some(extent) = span {
+        return vec![extent; dims.len()];
+    }
     let uniform = dims.windows(2).all(|pair| pair[0] == pair[1]);
     shared_render_dims(dims, source, mode, supported, uniform)
 }

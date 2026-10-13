@@ -3,7 +3,7 @@ use super::model::StartFade;
 use super::readiness::signal_ready;
 use crate::{ctl, shared, wayland};
 use anyhow::{Context, Result, anyhow};
-use paper_control::{MultiVideoEntry, PaperCommand};
+use paper_control::{FillMode, MultiVideoEntry, PaperCommand};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ struct Group {
     with_audio: bool,
 }
 
-fn group_entries(entries: &[MultiVideoEntry]) -> Vec<Group> {
+fn group_entries(entries: &[MultiVideoEntry], mode: FillMode) -> Vec<Group> {
     let mut entries = entries.to_vec();
     entries.sort_by(|lhs, rhs| lhs.output.cmp(&rhs.output));
 
@@ -41,8 +41,14 @@ fn group_entries(entries: &[MultiVideoEntry]) -> Vec<Group> {
     }
 
     let mut groups = Vec::<Group>::new();
-    for entry in entries {
+    for entry in entries.iter().cloned() {
         let transition_from = entry.transition_from.filter(|from| from != &entry.video);
+        let mixed = mode == FillMode::Span
+            && entries.iter().filter(|candidate| candidate.video == entry.video).any(|candidate| {
+                candidate.transition_from.as_deref().filter(|from| *from != candidate.video)
+                    != transition_from.as_deref()
+            });
+        let transition_from = transition_from.filter(|_| !mixed);
         if let Some(group) = groups
             .iter_mut()
             .find(|group| group.video == entry.video && group.transition_from == transition_from)
@@ -82,7 +88,7 @@ pub(super) fn run_multi(
     duration_ms: u64,
 ) -> Result<()> {
     let sd = Arc::new(shared::create(std::ptr::null_mut()).context("shared device")?);
-    let groups = group_entries(entries);
+    let groups = group_entries(entries, crate::fill::fill_mode());
     tracing::info!(
         outputs = entries.len(),
         groups = groups.len(),

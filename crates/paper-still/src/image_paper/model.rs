@@ -92,4 +92,6 @@ pub(super) struct SurfaceState {
     pub(super) attached: bool,
     pub(super) span_pool: Option<SlotPool>,
     pub(super) span_keepalive: Option<smithay_client_toolkit::shm::slot::Buffer>,
+    pub(super) shown: Option<super::mirror::Shown>,
+    pub(super) mirror: Option<super::mirror::Mirror>,
 }

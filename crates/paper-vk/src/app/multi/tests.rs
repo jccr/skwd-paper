@@ -24,11 +24,35 @@ fn same_source_decodes_once_unless_transition_sources_differ() {
         entry("DP-1", "/v/new.mp4", false, Some("/v/old-a.mp4")),
         entry("DP-3", "/v/other.mp4", true, None),
     ];
-    let groups = group_entries(&entries);
+    let groups = group_entries(&entries, FillMode::Fill);
     assert_eq!(groups.len(), 3);
     assert!(groups[0].with_audio);
     assert!(!groups[1].with_audio);
     assert_eq!((groups[0].mute, groups[0].volume), (false, 42));
+}
+
+#[test]
+fn span_cuts_mixed_sources() {
+    let entries = vec![
+        entry("DP-2", "/v/new.mp4", true, Some("/v/old-b.mp4")),
+        entry("DP-1", "/v/new.mp4", false, Some("/v/old-a.mp4")),
+    ];
+    let groups = group_entries(&entries, FillMode::Span);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].outputs, ["DP-1", "DP-2"]);
+    assert_eq!(groups[0].transition_from, None);
+    assert!(groups[0].with_audio);
+}
+
+#[test]
+fn span_fades_common_source() {
+    let entries = vec![
+        entry("DP-2", "/v/new.mp4", true, Some("/v/old.mp4")),
+        entry("DP-1", "/v/new.mp4", false, Some("/v/old.mp4")),
+    ];
+    let groups = group_entries(&entries, FillMode::Span);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].transition_from.as_deref(), Some("/v/old.mp4"));
 }
 
 #[test]

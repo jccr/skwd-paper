@@ -1,5 +1,6 @@
 use super::{
-    Layer, Parallax, Properties, ancestor_chain, id_of, number, resolve_transform, truthy, vec3,
+    Attachments, Layer, Parallax, Properties, ancestor_chain, id_of, number, resolve_transform,
+    truthy, vec3,
 };
 use serde_json::Value;
 
@@ -46,6 +47,7 @@ pub fn particle_frames<'a>(
     ids: impl Iterator<Item = &'a str>,
     canvas: (f32, f32),
     props: &Properties,
+    attachments: &Attachments<'_>,
 ) -> Vec<Option<ParticleFrame>> {
     let objects = scene["objects"].as_array().map_or(&[][..], Vec::as_slice);
     let by_id: std::collections::HashMap<String, &Value> =
@@ -53,7 +55,7 @@ pub fn particle_frames<'a>(
     let parallax = Parallax::of(scene, canvas, props);
     ids.map(|id| {
         let object = by_id.get(id)?;
-        Some(particle_frame(object, &by_id, props, parallax.as_ref()))
+        Some(particle_frame(object, &by_id, props, parallax.as_ref(), attachments))
     })
     .collect()
 }
@@ -63,8 +65,9 @@ pub(super) fn particle_frame(
     by_id: &std::collections::HashMap<String, &Value>,
     props: &Properties,
     parallax: Option<&Parallax>,
+    attachments: &Attachments<'_>,
 ) -> ParticleFrame {
-    let transform = resolve_transform(object, by_id, props, parallax);
+    let transform = resolve_transform(object, by_id, props, parallax, attachments);
     let ancestors = ancestor_chain(object, by_id);
     let visible = ancestors.iter().all(|node| truthy(node.get("visible"), props, true));
     let scale_z = ancestors
@@ -93,7 +96,13 @@ impl Layout {
             .iter()
             .find(|o| o.get("id").and_then(id_of).as_deref() == Some(layer.id.as_str()));
         let transform = object.map(|o| {
-            resolve_transform(o, &by_id, props, Parallax::of(scene, canvas, props).as_ref())
+            resolve_transform(
+                o,
+                &by_id,
+                props,
+                Parallax::of(scene, canvas, props).as_ref(),
+                &Attachments::new(),
+            )
         });
         let scale = layer.scale;
         let fallback = object
@@ -127,6 +136,7 @@ pub fn frames(
     layouts: &[Layout],
     canvas: (f32, f32),
     props: &Properties,
+    attachments: &Attachments<'_>,
 ) -> Vec<Option<Frame>> {
     let objects = scene["objects"].as_array().map_or(&[][..], Vec::as_slice);
     let by_id: std::collections::HashMap<String, &Value> =
@@ -136,7 +146,7 @@ pub fn frames(
         .iter()
         .map(|layout| {
             let object = by_id.get(&layout.id)?;
-            let t = resolve_transform(object, &by_id, props, parallax.as_ref());
+            let t = resolve_transform(object, &by_id, props, parallax.as_ref(), attachments);
             let visible = ancestor_chain(object, &by_id)
                 .iter()
                 .all(|o| truthy(o.get("visible"), props, true));

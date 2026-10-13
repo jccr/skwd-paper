@@ -7,6 +7,10 @@ pub mod script;
 
 pub const MAX_SCENE_TEXTURE_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_SCENE_OBJECTS: usize = 16_384;
+const MAX_USER_TEXTURE_FILE_BYTES: usize = 16 << 20;
+const MS_PER_SECOND: f32 = 1000.0;
+const MIN_GIF_FRAME_SECONDS: f32 = 0.01;
+const USER_TEXTURES_FIELD: &str = "usertextures";
 
 pub struct SceneModel {
     pub scripts: Option<crate::script::SceneScripts>,
@@ -74,6 +78,10 @@ pub struct Puppet {
     pub size: (f32, f32),
     pub layers: Vec<crate::puppet::AnimationLayer>,
 }
+
+pub type Attachments<'a> = std::collections::BTreeMap<(&'a str, &'a str), crate::puppet::Transform>;
+const ATTACHMENT_FIELD: &str = "attachment";
+const PARENT_FIELD: &str = "parent";
 
 pub type Properties = std::collections::BTreeMap<String, Vec<f32>>;
 
@@ -220,10 +228,28 @@ fn resolve_transform<'a>(
     by_id: &std::collections::HashMap<String, &'a Value>,
     props: &Properties,
     parallax: Option<&Parallax>,
+    attachments: &Attachments<'_>,
 ) -> Transform {
     let chain = ancestor_chain(object, by_id);
     let mut out = Transform { scale: (1.0, 1.0), ..Transform::default() };
     for node in chain.iter().rev() {
+        if let Some(parent) = node.get(PARENT_FIELD).and_then(id_of)
+            && let Some(name) = node.get(ATTACHMENT_FIELD).and_then(Value::as_str)
+            && let Some(attachment) = attachments.get(&(parent.as_str(), name))
+        {
+            out = compose(
+                out,
+                Transform {
+                    origin: (
+                        attachment.translation[0],
+                        attachment.translation[1],
+                        attachment.translation[2],
+                    ),
+                    scale: (attachment.scale[0], attachment.scale[1]),
+                    angle: attachment.rotation[2],
+                },
+            );
+        }
         out = compose(out, object_transform(node, props));
     }
     if let Some(parallax) = parallax
@@ -523,6 +549,76 @@ pub fn load_texture_bytes(bytes: &[u8]) -> Option<Texture> {
     })
 }
 
+fn user_image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(tex::MAX_TEXTURE_EDGE);
+    limits.max_image_height = Some(tex::MAX_TEXTURE_EDGE);
+    limits.max_alloc = Some(tex::MAX_RGBA_BYTES as u64);
+    limits
+}
+
+fn load_user_texture(bytes: &[u8]) -> Option<Texture> {
+    use image::{AnimationDecoder, ImageDecoder};
+    use std::io::Cursor;
+
+    let format = image::guess_format(bytes).ok()?;
+    if format == image::ImageFormat::Gif {
+        let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).ok()?;
+        let (width, height) = decoder.dimensions();
+        let frame_bytes = tex::PixelFormat::Rgba8.level_bytes(width, height)?;
+        decoder.set_limits(user_image_limits()).ok()?;
+        let mut texture = solid_texture();
+        texture.width = width;
+        texture.height = height;
+        texture.img_width = width;
+        texture.img_height = height;
+        let mut used = 0usize;
+        for frame in decoder.into_frames() {
+            used = used.checked_add(frame_bytes)?;
+            if used > tex::MAX_RGBA_BYTES {
+                return None;
+            }
+            let frame = frame.ok()?;
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let pixels = frame.into_buffer();
+            if pixels.dimensions() != (width, height) {
+                return None;
+            }
+            let pixels = tex::Pixels::rgba(width, height, pixels.into_raw());
+            let image = i32::try_from(texture.frames.len()).ok()?;
+            texture.frames.push(SpriteFrame {
+                uv: [0.0, 0.0, 1.0, 1.0],
+                rotated: false,
+                time: (numer as f32 / denom.max(1) as f32 / MS_PER_SECOND)
+                    .max(MIN_GIF_FRAME_SECONDS),
+                image,
+            });
+            if image == 0 {
+                texture.pixels = pixels;
+            } else {
+                texture.pages.push(pixels);
+            }
+        }
+        if texture.frames.is_empty() {
+            return None;
+        }
+        texture.image_count = texture.frames.len();
+        return Some(texture);
+    }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+    reader.limits(user_image_limits());
+    let image = reader.decode().ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    tex::PixelFormat::Rgba8.level_bytes(width, height)?;
+    let mut texture = solid_texture();
+    texture.width = width;
+    texture.height = height;
+    texture.img_width = width;
+    texture.img_height = height;
+    texture.pixels = tex::Pixels::rgba(width, height, image.into_raw());
+    Some(texture)
+}
+
 pub fn load_texture_named(pkg: &Package, raw: &str) -> Option<Texture> {
     load_texture(pkg, raw)
 }
@@ -609,17 +705,23 @@ fn material_is_flat(material: &Value) -> bool {
         .is_some_and(|shader| shader == "flat")
 }
 
-fn material_texture(pkg: &Package, path: &str) -> Option<String> {
+fn material_texture(pkg: &Package, path: &str) -> Option<(String, Option<String>)> {
     let material = pkg.find_json(path).ok()??;
     let passes = material.get("passes")?.as_array()?;
     for pass in passes {
         if let Some(textures) = pass.get("textures").and_then(Value::as_array) {
-            for slot in textures {
+            for (index, slot) in textures.iter().enumerate() {
                 if let Some(text) = slot.as_str()
                     && !text.is_empty()
                     && !text.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("_rt_"))
                 {
-                    return Some(text.to_string());
+                    let user = pass
+                        .get(USER_TEXTURES_FIELD)
+                        .and_then(Value::as_array)
+                        .and_then(|textures| textures.get(index))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    return Some((text.to_string(), user));
                 }
             }
         }
@@ -648,7 +750,7 @@ fn legacy_material_tint(pkg: &Package, model_path: &str) -> Option<([f32; 3], f3
     Some(([brightness; 3], alpha))
 }
 
-fn model_texture(pkg: &Package, path: &str) -> Option<String> {
+fn model_texture(pkg: &Package, path: &str) -> Option<(String, Option<String>)> {
     let model = pkg.find_json(path).ok()??;
     let material = model.get("material")?.as_str()?;
     material_texture(pkg, material)
@@ -710,23 +812,27 @@ pub fn load_from_dir_with_storage(
     overrides: &Properties,
     storage: Option<crate::script::Storage>,
 ) -> Result<SceneModel> {
-    let project = std::fs::read(dir.join("project.json"))
+    let project_value = std::fs::read(dir.join("project.json"))
         .ok()
         .and_then(|bytes| crate::json::parse(&bytes).ok())
         .unwrap_or(Value::Null);
-    let project = if project.get("dependency").is_some() || project.get("preset").is_some() {
-        paper_control::we_project::Project::resolve(dir)?.document
-    } else {
-        project
-    };
-    let properties = crate::effects::parse_properties(&project);
+    let project =
+        if project_value.get("dependency").is_some() || project_value.get("preset").is_some() {
+            Some(paper_control::we_project::Project::resolve(dir)?)
+        } else {
+            None
+        };
+    let document = project.as_ref().map_or(&project_value, |project| &project.document);
+    let properties = crate::effects::parse_properties(document);
     let configured = std::env::var("SKWD_WE_ASSETS").ok();
+    let mut assets = crate::effects::Assets::discover(configured.as_deref());
+    let source = project.as_ref().map_or(dir, |project| project.source.as_path());
+    let directories = project.as_ref().map_or(&[][..], |project| project.directories.as_slice());
+    assets = assets.with_scene_textures(document, source, directories)?;
     load_with_project(
         pkg,
-        &crate::effects::Assets::discover(configured.as_deref())
-            .with_properties(properties)
-            .with_overrides(overrides.clone()),
-        &project,
+        &assets.with_properties(properties).with_overrides(overrides.clone()),
+        document,
         storage,
     )
 }
@@ -743,6 +849,7 @@ fn load_with_project(
 ) -> Result<SceneModel> {
     let props = &assets.properties;
     let mut scene = pkg.scene_json()?;
+    crate::text::bind_user_values(&mut scene, project);
     let mut keyframes = crate::keyframe::Bindings::parse(&mut scene)?;
     let mut scripts =
         crate::script::SceneScripts::load_with_storage(&mut scene, props, project, storage)?;
@@ -821,8 +928,13 @@ fn load_with_project(
             if let Some(path) = object.get("particle").and_then(Value::as_str) {
                 match crate::particles::load(pkg, assets, object, path) {
                     Some(mut system) => {
-                        let state =
-                            script::particle_frame(object, &by_id, props, parallax.as_ref());
+                        let state = script::particle_frame(
+                            object,
+                            &by_id,
+                            props,
+                            parallax.as_ref(),
+                            &Attachments::new(),
+                        );
                         state.apply(&mut system);
                         if let Some(texture) = &system.texture {
                             add_texture_bytes(&mut texture_bytes, texture.payload_bytes())?;
@@ -846,7 +958,13 @@ fn load_with_project(
                     crate::text::render(pkg, assets, object, props).map(|r| (r, None))
                 } {
                     Some((rendered, script_text)) => {
-                        let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
+                        let transform = resolve_transform(
+                            object,
+                            &by_id,
+                            props,
+                            parallax.as_ref(),
+                            &Attachments::new(),
+                        );
                         let (w, h) =
                             (rendered.texture.width as f32, rendered.texture.height as f32);
                         let color = vec3(object.get("color"), props)
@@ -914,8 +1032,13 @@ fn load_with_project(
         let media_texture = object.pointer("/instance/usertextures/0").and_then(MediaTexture::of);
         let texture = if let Some(kind) = media_texture {
             kind.texture()
-        } else if let Some(tex_path) = resolved {
-            let Some(texture) = load_texture_or_asset(pkg, assets, &tex_path) else {
+        } else if let Some((tex_path, user)) = resolved {
+            let texture = user
+                .as_deref()
+                .and_then(|name| assets.scene_texture_bytes(name, MAX_USER_TEXTURE_FILE_BYTES))
+                .and_then(|bytes| load_user_texture(&bytes))
+                .or_else(|| load_texture_or_asset(pkg, assets, &tex_path));
+            let Some(texture) = texture else {
                 skipped.push(format!("{name}: undecodable texture {tex_path}"));
                 continue;
             };
@@ -933,7 +1056,8 @@ fn load_with_project(
                 continue;
             }
         };
-        let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
+        let transform =
+            resolve_transform(object, &by_id, props, parallax.as_ref(), &Attachments::new());
         let fallback = if util.passthrough {
             canvas
         } else {
@@ -1083,6 +1207,7 @@ fn load_with_project(
         particles.iter().map(|layer| layer.id.as_str()),
         canvas,
         props,
+        &Attachments::new(),
     );
     for (layer, state) in particles.iter_mut().zip(particle_states) {
         if let Some(state) = state {
@@ -1136,8 +1261,12 @@ fn load_with_project(
         }
     }
     Ok(SceneModel {
-        animated_scene: (scripts.is_none() && !keyframes.is_empty())
-            .then(|| (scene.clone(), props.clone())),
+        animated_scene: (scripts.is_none()
+            && (!keyframes.is_empty()
+                || layers.iter().any(|layer| {
+                    layer.puppet.as_ref().is_some_and(|puppet| !puppet.mesh.attachments.is_empty())
+                })))
+        .then(|| (scene.clone(), props.clone())),
         keyframes,
         scripts,
         canvas,

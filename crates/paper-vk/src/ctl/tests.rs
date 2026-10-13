@@ -35,6 +35,7 @@ fn ctl_reduce() {
         outputs: None,
         properties: None,
         pointer: None,
+        mirror: None,
     })
     .unwrap();
     assert!(ctl.poll().is_none());
@@ -55,6 +56,7 @@ fn ctl_reduce() {
         outputs: None,
         properties: None,
         pointer: None,
+        mirror: None,
     })
     .unwrap();
     assert!(ctl.poll().is_none());

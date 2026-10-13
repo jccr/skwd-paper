@@ -1,8 +1,10 @@
+mod mirror;
 mod model;
 mod pointer;
 mod protocol;
 mod target;
 
+pub(crate) use mirror::request as request_mirror;
 #[cfg(feature = "shared-device")]
 pub use model::SurfaceUi;
 pub use model::Target;

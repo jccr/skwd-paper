@@ -1,7 +1,7 @@
 use super::*;
 use paper_control::{
-    AudioSetRequest, Layer, RendererPolicy, SandPolicy, SandQuality, SandScope, ScenePolicy,
-    Source, TransitionPolicy, VideoEngine,
+    AudioSetRequest, FillMode, Layer, RendererPolicy, SandPolicy, SandQuality, SandScope,
+    ScenePolicy, Source, SourceKind, TransitionPolicy, VideoEngine,
 };
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -172,6 +172,221 @@ fn tinier_group_retarget() {
             status.iter().find(|entry| entry.pid == pid).unwrap().assignment.outputs,
             ["DP-3"]
         );
+    });
+}
+
+#[test]
+fn span_patch_stop() {
+    block_on(async {
+        for kind in [SourceKind::Static, SourceKind::Video, SourceKind::WallpaperEngine] {
+            let mut fixture = Fixture::new();
+            let source = match kind {
+                SourceKind::Static => Source::static_file("/wall/one.png"),
+                SourceKind::Video => Source::video("/wall/one.mp4", None),
+                SourceKind::WallpaperEngine => {
+                    let project = fixture.directory.path().join("scene");
+                    std::fs::create_dir(&project).unwrap();
+                    std::fs::write(
+                        project.join("project.json"),
+                        r#"{"type":"scene","file":"scene.pkg"}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(project.join("scene.pkg"), []).unwrap();
+                    Source::wallpaper_engine(project.display().to_string())
+                }
+            };
+            let mut span =
+                Assignment::new(vec!["DP-1".into(), "DP-2".into(), "DP-3".into()], source);
+            span.fill_mode = FillMode::Span;
+            span.mute = false;
+            span.volume = 45;
+            let first = fixture.commit(&apply(vec![span], false)).await;
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].assignment.outputs, ["DP-1", "DP-2", "DP-3"]);
+            let original_pid = first[0].pid;
+            let args = wait_log(fixture.directory.path(), "args", original_pid, "DP-1,DP-2,DP-3");
+            assert!(args.contains("--fill-mode\nspan"));
+
+            let next = apply(vec![assignment("DP-1", Source::static_file("/wall/two.png"))], false);
+            let mut transaction =
+                fixture.manager.begin_apply(&next, &fixture.socket).await.unwrap();
+            assert_eq!(fixture.manager.status()[0].pid, original_pid);
+            ready(&mut transaction).await;
+            let patched = fixture.manager.commit(transaction).await.unwrap();
+            assert_eq!(patched.len(), 2);
+            let remaining =
+                patched.iter().find(|entry| entry.assignment.outputs == ["DP-2", "DP-3"]).unwrap();
+            assert_ne!(remaining.pid, original_pid);
+            assert!(
+                wait_log(fixture.directory.path(), "args", remaining.pid, "DP-2,DP-3")
+                    .contains("--fill-mode\nspan")
+            );
+
+            let stop = StopRequest { outputs: vec!["DP-2".into()] };
+            let (mut transaction, count) =
+                fixture.manager.begin_stop(&stop, &fixture.socket).await.unwrap().unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(fixture.manager.status().len(), 2);
+            ready(&mut transaction).await;
+            let stopped = fixture.manager.commit(transaction).await.unwrap();
+            assert_eq!(stopped.len(), 2);
+            assert!(stopped.iter().any(|entry| entry.assignment.outputs == ["DP-1"]));
+            let final_worker =
+                stopped.iter().find(|entry| entry.assignment.outputs == ["DP-3"]).unwrap();
+            assert!(
+                wait_log(fixture.directory.path(), "args", final_worker.pid, "DP-3")
+                    .contains("--fill-mode\nspan")
+            );
+            assert!(stopped.iter().all(|entry| !entry.assignment.outputs.contains(&"DP-2".into())));
+        }
+    });
+}
+
+#[test]
+fn span_groups_compatible_assignments() {
+    let source = Source::video("/wall/one.mp4", None);
+    let mut first = assignment("DP-1", source.clone());
+    first.fill_mode = FillMode::Span;
+    first.mute = false;
+    first.volume = 45;
+    let mut second = assignment("DP-2", source.clone());
+    second.fill_mode = FillMode::Span;
+    second.mute = true;
+    second.volume = 100;
+    let grouped = expand(&[first.clone(), second.clone()], None);
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0].0.outputs, ["DP-1", "DP-2"]);
+    assert!(!grouped[0].0.mute);
+    assert_eq!(grouped[0].0.volume, 45);
+
+    let mut different_source = second.clone();
+    different_source.source = Source::video("/wall/two.mp4", None);
+    let mut different_mode = second.clone();
+    different_mode.fill_mode = FillMode::Fit;
+    assert_eq!(expand(&[first.clone(), different_source], None).len(), 2);
+    assert_eq!(expand(&[first.clone(), different_mode], None).len(), 2);
+    first.fill_mode = FillMode::Fill;
+    second.fill_mode = FillMode::Fill;
+    assert_eq!(expand(&[first, second], None).len(), 2);
+}
+
+#[test]
+fn span_mixed_hints_cut() {
+    let mut first = assignment("DP-1", Source::video("/wall/new.mp4", None));
+    first.fill_mode = FillMode::Span;
+    first.transition =
+        Some(TransitionPolicy { from: Some("/wall/old-one.mp4".into()), ..Default::default() });
+    let mut second = first.clone();
+    second.outputs = vec!["DP-2".into()];
+    second.transition.as_mut().unwrap().from = Some("/wall/old-two.mp4".into());
+
+    let cut = expand(&[first.clone(), second.clone()], None);
+    assert_eq!(cut.len(), 1);
+    assert_eq!(cut[0].0.outputs, ["DP-1", "DP-2"]);
+    assert!(cut[0].0.transition.is_none());
+
+    second.transition = first.transition.clone();
+    let fade = expand(&[first, second], None);
+    assert_eq!(fade.len(), 1);
+    assert_eq!(fade[0].0.transition.as_ref().unwrap().from.as_deref(), Some("/wall/old-one.mp4"));
+}
+
+#[test]
+fn span_mixed_incumbents_cut() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        fixture
+            .commit(&apply(
+                vec![
+                    assignment("DP-1", Source::video("/wall/old-one.mp4", None)),
+                    assignment("DP-2", Source::video("/wall/old-two.mp4", None)),
+                ],
+                true,
+            ))
+            .await;
+        let mut wildcard = assignment("*", Source::video("/wall/another.mp4", None));
+        wildcard.transition = Some(TransitionPolicy::default());
+        let error = fixture
+            .manager
+            .begin_apply(&apply(vec![wildcard], true), &fixture.socket)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("explicit from hint"));
+        let mut span = Assignment::new(
+            vec!["DP-1".into(), "DP-2".into()],
+            Source::video("/wall/new.mp4", None),
+        );
+        span.fill_mode = FillMode::Span;
+        span.transition = Some(TransitionPolicy::default());
+        let mut transaction =
+            fixture.manager.begin_apply(&apply(vec![span], true), &fixture.socket).await.unwrap();
+        assert_eq!(transaction.candidates.len(), 1);
+        assert!(transaction.candidates[0].assignment.transition.is_none());
+        ready(&mut transaction).await;
+        let status = fixture.manager.commit(transaction).await.unwrap();
+        assert_eq!(status[0].assignment.outputs, ["DP-1", "DP-2"]);
+        let args = wait_log(fixture.directory.path(), "args", status[0].pid, "DP-1,DP-2");
+        assert!(args.contains("--fill-mode\nspan"));
+        assert!(!args.contains("--transition-from"));
+    });
+}
+
+#[test]
+fn span_missing_preview_cut() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let project = fixture.directory.path().join("scene");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("project.json"), r#"{"type":"scene","file":"scene.pkg"}"#)
+            .unwrap();
+        std::fs::write(project.join("scene.pkg"), []).unwrap();
+        fixture
+            .commit(&apply(
+                vec![assignment("DP-1", Source::wallpaper_engine(project.display().to_string()))],
+                true,
+            ))
+            .await;
+
+        let mut span = Assignment::new(
+            vec!["DP-1".into(), "DP-2".into()],
+            Source::video("/wall/new.mp4", None),
+        );
+        span.fill_mode = FillMode::Span;
+        span.transition = Some(TransitionPolicy::default());
+        let transaction =
+            fixture.manager.begin_apply(&apply(vec![span], true), &fixture.socket).await.unwrap();
+        assert_eq!(transaction.candidates.len(), 1);
+        assert!(transaction.candidates[0].assignment.transition.is_none());
+        transaction.rollback().await;
+    });
+}
+
+#[test]
+fn span_spawn_failure() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let mut span = Assignment::new(
+            vec!["DP-1".into(), "DP-2".into()],
+            Source::static_file("/wall/one.png"),
+        );
+        span.fill_mode = FillMode::Span;
+        let first = fixture.commit(&apply(vec![span], false)).await;
+        let original_pid = first[0].pid;
+        std::fs::remove_file(fixture.directory.path().join("worker")).unwrap();
+
+        let replacement =
+            apply(vec![assignment("DP-1", Source::static_file("/wall/two.png"))], false);
+        assert!(fixture.manager.begin_apply(&replacement, &fixture.socket).await.is_err());
+        assert_eq!(fixture.manager.status()[0].pid, original_pid);
+        assert!(
+            fixture
+                .manager
+                .begin_stop(&StopRequest { outputs: vec!["DP-1".into()] }, &fixture.socket)
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.manager.status()[0].pid, original_pid);
     });
 }
 
@@ -947,5 +1162,161 @@ fn live_surface_effects_preserve_workers_and_follow_replacement() {
             .unwrap();
             assert!(!lines.contains("\"blur\":80"));
         }
+    });
+}
+
+#[test]
+fn mirror_routes_output() {
+    block_on(async {
+        for source in [
+            Source::static_file("/wall/a.png"),
+            Source::video("/wall/a.mp4", None),
+            Source::tinier_video("/wall/a.ivf", "30"),
+        ] {
+            let mut fixture = Fixture::new_with_tinier();
+            let status = fixture
+                .commit(&apply(
+                    vec![
+                        assignment("DP-1", source),
+                        assignment("DP-2", Source::static_file("/wall/b.png")),
+                    ],
+                    false,
+                ))
+                .await;
+            let target = paper_control::MirrorTarget {
+                output: "DP-1".into(),
+                socket: "/run/lock.sock".into(),
+            };
+            fixture.manager.mirror(&target).await.unwrap();
+            let pid =
+                status.iter().find(|status| status.assignment.outputs == ["DP-1"]).unwrap().pid;
+            let lines = wait_log(fixture.directory.path(), "stdin", pid, "mirror");
+            let command: serde_json::Value =
+                serde_json::from_str(lines.lines().last().unwrap()).unwrap();
+            assert_eq!(
+                command["mirror"],
+                serde_json::json!({"output":"DP-1","socket":"/run/lock.sock"})
+            );
+            let other =
+                status.iter().find(|status| status.assignment.outputs == ["DP-2"]).unwrap().pid;
+            assert!(!fixture.directory.path().join(format!("stdin-{other}")).exists());
+            assert!(
+                fixture
+                    .manager
+                    .mirror(&paper_control::MirrorTarget {
+                        output: "missing".into(),
+                        socket: target.socket
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+    });
+}
+
+#[test]
+fn mirrors_follow_replacement() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let socket = fixture.directory.path().join("mirror.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        fixture
+            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/a.mp4", None))], false))
+            .await;
+        let target = paper_control::MirrorTarget {
+            output: "DP-1".into(),
+            socket: socket.display().to_string(),
+        };
+        fixture.manager.mirror(&target).await.unwrap();
+        let mut pause = fixture.manager.begin_pause(&fixture.socket).await.unwrap().unwrap();
+        ready(&mut pause).await;
+        let paused = fixture.manager.commit_pause(pause).await.unwrap();
+        assert!(
+            wait_log(fixture.directory.path(), "stdin", paused[0].pid, "mirror")
+                .contains(&target.socket)
+        );
+        let mut resume = fixture.manager.begin_resume(&fixture.socket).await.unwrap().unwrap();
+        ready(&mut resume).await;
+        let resumed = fixture.manager.commit_resume(resume).await.unwrap();
+        assert_ne!(paused[0].pid, resumed[0].pid);
+        assert!(
+            wait_log(fixture.directory.path(), "stdin", resumed[0].pid, "mirror")
+                .contains(&target.socket)
+        );
+        let replaced = fixture
+            .commit(&apply(vec![assignment("DP-1", Source::static_file("/wall/b.png"))], false))
+            .await;
+        assert_ne!(resumed[0].pid, replaced[0].pid);
+        assert!(
+            wait_log(fixture.directory.path(), "stdin", replaced[0].pid, "mirror")
+                .contains(&target.socket)
+        );
+        drop(listener);
+        assert!(socket.exists());
+        fixture
+            .commit(&apply(vec![assignment("DP-1", Source::static_file("/wall/c.png"))], false))
+            .await;
+        assert!(fixture.manager.mirrors.is_empty());
+    });
+}
+
+#[test]
+fn disable_removes_registration() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        fixture
+            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/a.mp4", None))], false))
+            .await;
+        let mut target =
+            paper_control::MirrorTarget { output: "DP-1".into(), socket: "/run/lock.sock".into() };
+        fixture.manager.mirror(&target).await.unwrap();
+        assert_eq!(fixture.manager.mirrors.len(), 1);
+        target.socket.clear();
+        fixture.manager.mirror(&target).await.unwrap();
+        assert!(fixture.manager.mirrors.is_empty());
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+        fixture.manager.mirror(&target).await.unwrap();
+        assert!(fixture.manager.is_empty());
+    });
+}
+
+#[test]
+fn span_mirror_survives_stop() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let socket = fixture.directory.path().join("mirror.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut span = Assignment::new(
+            vec!["DP-1".into(), "DP-2".into()],
+            Source::static_file("/wall/span.png"),
+        );
+        span.fill_mode = FillMode::Span;
+        fixture.commit(&apply(vec![span], false)).await;
+        for output in ["DP-1", "DP-2"] {
+            fixture
+                .manager
+                .mirror(&paper_control::MirrorTarget {
+                    output: output.into(),
+                    socket: socket.display().to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        let (mut transaction, _) = fixture
+            .manager
+            .begin_stop(&StopRequest { outputs: vec!["DP-1".into()] }, &fixture.socket)
+            .await
+            .unwrap()
+            .unwrap();
+        ready(&mut transaction).await;
+        let remaining = fixture.manager.commit(transaction).await.unwrap();
+        assert_eq!(remaining[0].assignment.outputs, ["DP-2"]);
+        assert_eq!(fixture.manager.mirrors.keys().collect::<Vec<_>>(), ["DP-2"]);
+        let commands = wait_log(fixture.directory.path(), "stdin", remaining[0].pid, "mirror");
+        assert!(commands.contains("DP-2"));
+        assert!(!commands.contains("DP-1"));
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+        assert!(fixture.manager.mirrors.is_empty());
+        assert!(fixture.manager.is_empty());
     });
 }

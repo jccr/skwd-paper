@@ -1,7 +1,33 @@
 use super::{
     all_surfaces_presented_after, commit_due, desktop_is_kwin, input_passthrough_for,
-    return_free_buffer, session_flag_enabled,
+    return_free_buffer, session_flag_enabled, viewport_crop,
 };
+use paper_geom::FillMode;
+
+#[test]
+fn span_crops_offset_outputs() {
+    let bounds = paper_geom::desktop_bounds(&[(-800, 100, 800, 600), (0, -200, 800, 600)]);
+    assert_eq!(bounds, Some((-800, -200, 1600, 900)));
+    assert_eq!(
+        viewport_crop(FillMode::Span, (3200, 1800), (800, 600), Some((-800, 100)), bounds),
+        (0, 600, 1600, 1200)
+    );
+    assert_eq!(
+        viewport_crop(FillMode::Span, (3200, 1800), (800, 600), Some((0, -200)), bounds),
+        (1600, 0, 1600, 1200)
+    );
+}
+
+#[test]
+fn fill_keeps_local_crop() {
+    let bounds = Some((-800, -200, 1600, 900));
+    let fill = paper_geom::fill_crop_rect(3200, 1800, 800, 600);
+    assert_eq!(
+        viewport_crop(FillMode::Fill, (3200, 1800), (800, 600), Some((0, -200)), bounds),
+        fill
+    );
+    assert_eq!(viewport_crop(FillMode::Span, (3200, 1800), (800, 600), None, bounds), fill);
+}
 
 #[test]
 fn presentation_barrier_requires_every_surface_to_advance() {

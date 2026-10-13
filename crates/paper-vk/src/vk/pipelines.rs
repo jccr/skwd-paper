@@ -210,6 +210,17 @@ struct PipelineSpec<'a> {
     extent: vk::Extent2D,
 }
 
+fn raster_pipeline_info<'a>(
+    viewport: &'a vk::PipelineViewportStateCreateInfo<'a>,
+    raster: &'a vk::PipelineRasterizationStateCreateInfo<'a>,
+    samples: &'a vk::PipelineMultisampleStateCreateInfo<'a>,
+) -> vk::GraphicsPipelineCreateInfo<'a> {
+    vk::GraphicsPipelineCreateInfo::default()
+        .viewport_state(viewport)
+        .rasterization_state(raster)
+        .multisample_state(samples)
+}
+
 unsafe fn build_pipeline(device: &ash::Device, spec: &PipelineSpec<'_>) -> Result<vk::Pipeline> {
     let vert = make_module(device, spec.vert)?;
     let frag = make_module(device, spec.frag)?;
@@ -244,13 +255,10 @@ unsafe fn build_pipeline(device: &ash::Device, spec: &PipelineSpec<'_>) -> Resul
     let blend_att = [spec.blend];
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(spec.dynamic);
-    let mut info = vk::GraphicsPipelineCreateInfo::default()
+    let mut info = raster_pipeline_info(&vp, &rs, &ms)
         .stages(&stages)
         .vertex_input_state(&vi)
         .input_assembly_state(&ia)
-        .viewport_state(&vp)
-        .rasterization_state(&rs)
-        .multisample_state(&ms)
         .color_blend_state(&blend)
         .layout(spec.layout)
         .render_pass(spec.render_pass)
@@ -439,23 +447,17 @@ impl Renderer {
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&att);
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+            let layer_info = raster_pipeline_info(&vp, &rs, &ms)
+                .stages(&stages)
+                .vertex_input_state(&vi)
+                .input_assembly_state(&ia)
+                .color_blend_state(&blend)
+                .dynamic_state(&dynamic)
+                .layout(self.pipeline_layout_layer)
+                .render_pass(self.scene_pass)
+                .subpass(0);
             self.pipeline_layer = device
-                .create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&stages)
-                        .vertex_input_state(&vi)
-                        .input_assembly_state(&ia)
-                        .viewport_state(&vp)
-                        .rasterization_state(&rs)
-                        .multisample_state(&ms)
-                        .color_blend_state(&blend)
-                        .dynamic_state(&dynamic)
-                        .layout(self.pipeline_layout_layer)
-                        .render_pass(self.scene_pass)
-                        .subpass(0)],
-                    None,
-                )
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[layer_info], None)
                 .map_err(|(_, err)| err)?[0];
             let att_add = [vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
@@ -470,18 +472,7 @@ impl Renderer {
             self.pipeline_layer_add = device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&stages)
-                        .vertex_input_state(&vi)
-                        .input_assembly_state(&ia)
-                        .viewport_state(&vp)
-                        .rasterization_state(&rs)
-                        .multisample_state(&ms)
-                        .color_blend_state(&blend_add)
-                        .dynamic_state(&dynamic)
-                        .layout(self.pipeline_layout_layer)
-                        .render_pass(self.scene_pass)
-                        .subpass(0)],
+                    &[layer_info.color_blend_state(&blend_add)],
                     None,
                 )
                 .map_err(|(_, err)| err)?[0];
@@ -492,18 +483,7 @@ impl Renderer {
             self.pipeline_layer_copy = device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&stages)
-                        .vertex_input_state(&vi)
-                        .input_assembly_state(&ia)
-                        .viewport_state(&vp)
-                        .rasterization_state(&rs)
-                        .multisample_state(&ms)
-                        .color_blend_state(&blend_copy)
-                        .dynamic_state(&dynamic)
-                        .layout(self.pipeline_layout_layer)
-                        .render_pass(self.scene_pass)
-                        .subpass(0)],
+                    &[layer_info.color_blend_state(&blend_copy)],
                     None,
                 )
                 .map_err(|(_, err)| err)?[0];
@@ -521,18 +501,7 @@ impl Renderer {
             self.pipeline_layer_screen = device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&stages)
-                        .vertex_input_state(&vi)
-                        .input_assembly_state(&ia)
-                        .viewport_state(&vp)
-                        .rasterization_state(&rs)
-                        .multisample_state(&ms)
-                        .color_blend_state(&blend_screen)
-                        .dynamic_state(&dynamic)
-                        .layout(self.pipeline_layout_layer)
-                        .render_pass(self.scene_pass)
-                        .subpass(0)],
+                    &[layer_info.color_blend_state(&blend_screen)],
                     None,
                 )
                 .map_err(|(_, err)| err)?[0];
@@ -570,18 +539,10 @@ impl Renderer {
             self.pipeline_puppet = device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
+                    &[layer_info
                         .stages(&puppet_stages)
                         .vertex_input_state(&puppet_vi)
-                        .input_assembly_state(&puppet_ia)
-                        .viewport_state(&vp)
-                        .rasterization_state(&rs)
-                        .multisample_state(&ms)
-                        .color_blend_state(&blend_copy)
-                        .dynamic_state(&dynamic)
-                        .layout(self.pipeline_layout_layer)
-                        .render_pass(self.scene_pass)
-                        .subpass(0)],
+                        .input_assembly_state(&puppet_ia)],
                     None,
                 )
                 .map_err(|(_, err)| err)?[0];

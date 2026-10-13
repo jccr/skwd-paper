@@ -31,7 +31,25 @@ jobs:
       SKWD_VERIFY_ROOT: .ci/checkouts/skwd-verify
       SKWD_VERIFY_TEST_ENV: /var/tmp/skwd-verify-venv-${{ github.run_id }}-${{ github.run_attempt }}
       TMPDIR: /var/tmp/skwd-verify-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+      TMP: /var/tmp/skwd-verify-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+      TEMP: /var/tmp/skwd-verify-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+      RUNNER_TEMP: /var/tmp/skwd-verify-tmp-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      - name: Prepare temporary storage
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMPDIR"
+          test "$TMP" = "$TMPDIR"
+          test "$TEMP" = "$TMPDIR"
+          test "$RUNNER_TEMP" = "$TMPDIR"
+          scratch_fstype=$(findmnt -n -o FSTYPE -T "$TMPDIR")
+          case "$scratch_fstype" in
+            ""|tmpfs|ramfs) exit 1 ;;
+          esac
+          findmnt -T "$TMPDIR"
+          df -h "$TMPDIR"
+
       - name: Check out Paper
         uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

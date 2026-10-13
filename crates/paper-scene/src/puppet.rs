@@ -8,6 +8,8 @@ const VERTEX_STRIDE: usize = 80;
 const MAX_VERTICES: usize = u16::MAX as usize + 1;
 const MAX_INDICES: usize = 3_000_000;
 const MAX_ANIMATION_SAMPLES: usize = 1_000_000;
+const ATTACHMENT_MAGIC: &str = "MDAT0001";
+const ATTACHMENT_MATRIX_FLOATS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex {
@@ -23,7 +25,15 @@ pub struct Mesh {
     pub indices: Vec<u16>,
     pub bones: Vec<Bone>,
     pub animations: Vec<Animation>,
+    pub attachments: Vec<Attachment>,
     bind_inverse: Vec<Option<Affine>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    pub bone: u16,
+    pub transform: Transform,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,12 +80,13 @@ pub fn parse(bytes: &[u8]) -> Result<Mesh> {
     let indices_at = start + 8 + vertex_bytes + 4;
     let indices = parse_indices(bytes, indices_at, index_bytes / 2, vertex_count)?;
     let (bones, animation_at) = parse_bones(bytes, skeleton)?;
+    let (attachments, animation_at) = parse_attachments(bytes, animation_at, bones.len())?;
     let animations = parse_animations(bytes, animation_at, bones.len())?;
     let bind_inverse = world(bones.iter().map(|bone| bone.bind), &bones)
         .into_iter()
         .map(Affine::inverse)
         .collect();
-    Ok(Mesh { vertices, indices, bones, animations, bind_inverse })
+    Ok(Mesh { vertices, indices, bones, animations, attachments, bind_inverse })
 }
 
 fn locate(bytes: &[u8], end: usize) -> Result<(usize, usize, usize)> {
@@ -185,6 +196,36 @@ fn parse_bones(bytes: &[u8], start: usize) -> Result<(Vec<Bone>, usize)> {
         return Err(anyhow!("invalid puppet animation offset {animation_at}"));
     }
     Ok((bones, animation_at))
+}
+
+fn parse_attachments(bytes: &[u8], start: usize, bones: usize) -> Result<(Vec<Attachment>, usize)> {
+    let mut at = start;
+    if cstring(bytes, &mut at)? != ATTACHMENT_MAGIC {
+        return Ok((Vec::new(), start));
+    }
+    let end = read_u32(bytes, &mut at)? as usize;
+    let section = bytes
+        .get(..end)
+        .filter(|_| end >= at)
+        .ok_or_else(|| anyhow!("invalid puppet attachment offset {end}"))?;
+    let count = read_u16(section, &mut at)?;
+    let mut attachments = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let bone = read_u16(section, &mut at)?;
+        if usize::from(bone) >= bones {
+            return Err(anyhow!("puppet attachment has invalid bone {bone}"));
+        }
+        let name = cstring(section, &mut at)?.to_owned();
+        let mut matrix = [0.0; ATTACHMENT_MATRIX_FLOATS];
+        for value in &mut matrix {
+            *value = read_f32(section, &mut at)?;
+        }
+        attachments.push(Attachment { name, bone, transform: matrix_transform(matrix)? });
+    }
+    if at != end {
+        return Err(anyhow!("puppet attachment section has trailing data"));
+    }
+    Ok((attachments, end))
 }
 
 fn parse_animations(bytes: &[u8], start: usize, bones: usize) -> Result<Vec<Animation>> {
@@ -336,7 +377,13 @@ impl Affine {
     }
 }
 
-pub fn skin(mesh: &Mesh, layers: &[AnimationLayer], time: f32) -> Vec<[f32; 3]> {
+#[derive(Debug, PartialEq)]
+pub struct Frame {
+    pub positions: Vec<[f32; 3]>,
+    pub attachments: Vec<Transform>,
+}
+
+pub fn skin(mesh: &Mesh, layers: &[AnimationLayer], time: f32) -> Frame {
     let mut locals: Vec<Transform> = mesh.bones.iter().map(|bone| bone.bind).collect();
     for layer in layers.iter().filter(|layer| layer.blend > 0.0) {
         let Some(animation) = mesh.animations.iter().find(|animation| animation.id == layer.id)
@@ -354,7 +401,26 @@ pub fn skin(mesh: &Mesh, layers: &[AnimationLayer], time: f32) -> Vec<[f32; 3]> 
         }
     }
     let posed = world(locals, &mesh.bones);
-    mesh.vertices.iter().map(|vertex| skin_vertex(vertex, &mesh.bind_inverse, &posed)).collect()
+    Frame {
+        positions: mesh
+            .vertices
+            .iter()
+            .map(|vertex| skin_vertex(vertex, &mesh.bind_inverse, &posed))
+            .collect(),
+        attachments: mesh
+            .attachments
+            .iter()
+            .map(|attachment| {
+                let transform =
+                    posed[usize::from(attachment.bone)].then(Affine::of(attachment.transform));
+                Transform {
+                    translation: [transform.x, transform.y, attachment.transform.translation[2]],
+                    rotation: [0.0, 0.0, transform.b.atan2(transform.a)],
+                    scale: [transform.a.hypot(transform.b), transform.c.hypot(transform.d), 1.0],
+                }
+            })
+            .collect(),
+    }
 }
 
 fn world(transforms: impl IntoIterator<Item = Transform>, bones: &[Bone]) -> Vec<Affine> {
@@ -448,6 +514,10 @@ fn take<'a>(bytes: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8]> {
     let value = bytes.get(*at..end).ok_or_else(|| anyhow!("puppet data is truncated"))?;
     *at = end;
     Ok(value)
+}
+
+fn read_u16(bytes: &[u8], at: &mut usize) -> Result<u16> {
+    Ok(u16::from_le_bytes(take(bytes, at, size_of::<u16>())?.try_into().unwrap()))
 }
 
 fn read_u32(bytes: &[u8], at: &mut usize) -> Result<u32> {

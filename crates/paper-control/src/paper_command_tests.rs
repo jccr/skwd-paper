@@ -106,3 +106,23 @@ fn pointer_commands_quantize_and_classify() {
     let plain: PaperCommand = serde_json::from_str("{\"to\":\"DP-1\",\"pause\":true}").unwrap();
     assert!(plain.pointer.is_none());
 }
+
+#[test]
+fn mirror_command_precedence() {
+    let command = PaperCommand::mirror("DP-2", "/run/user/1000/skwd-mini-lock/DP-2.sock");
+    assert_eq!(
+        command.line(),
+        "{\"to\":\"\",\"outputs\":[\"DP-2\"],\"mirror\":{\"output\":\"DP-2\",\"socket\":\"/run/user/1000/skwd-mini-lock/DP-2.sock\"}}\n"
+    );
+    assert_eq!(
+        classify_command(round_trip(&command)),
+        CommandClass::Mirror(crate::MirrorTarget {
+            output: "DP-2".into(),
+            socket: "/run/user/1000/skwd-mini-lock/DP-2.sock".into()
+        })
+    );
+    let stop: PaperCommand = serde_json::from_str(r#"{"mirror":{"output":"DP-2"}}"#).unwrap();
+    assert!(
+        matches!(classify_command(stop), CommandClass::Mirror(target) if target.socket.is_empty())
+    );
+}

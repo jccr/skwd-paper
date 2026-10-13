@@ -1,5 +1,192 @@
 use super::{Parallax, Properties, ancestor_chain, resolve_transform};
+use crate::tests::{build_pkg, build_tex};
 use serde_json::{Value, json};
+
+fn image_package() -> crate::pkg::Package {
+    let fallback = build_tex("TEXB0002", 0, 0, &[255; 64], false, None);
+    let scene = br#"{"general":{"orthogonalprojection":{"width":100,"height":100}},"objects":[{"id":1,"name":"left","image":"models/left.json","origin":"25 50 0","size":"20 20"},{"id":2,"name":"right","image":"models/right.json","origin":"75 50 0","size":"20 20"}]}"#;
+    crate::pkg::Package::parse(build_pkg(&[
+        ("scene.json", scene),
+        ("models/left.json", br#"{"material":"materials/left.json"}"#),
+        ("models/right.json", br#"{"material":"materials/right.json"}"#),
+        (
+            "materials/left.json",
+            br#"{"passes":[{"textures":["fallback"],"usertextures":["customleft"]}]}"#,
+        ),
+        (
+            "materials/right.json",
+            br#"{"passes":[{"textures":["fallback"],"usertextures":["customright"]}]}"#,
+        ),
+        ("materials/fallback.tex", &fallback),
+    ]))
+    .unwrap()
+}
+
+fn image_presets(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = root.join("1");
+    let middle = root.join("2");
+    let selected = root.join("3");
+    for dir in [&base, &middle, &selected] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::fs::write(base.join("project.json"), r#"{"type":"scene","general":{"properties":{"customleft":{"type":"scenetexture","value":""},"customright":{"type":"scenetexture","value":""}}}}"#).unwrap();
+    std::fs::write(
+        middle.join("project.json"),
+        r#"{"dependency":"1","preset":{"customleft":"files/über.jpeg"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        selected.join("project.json"),
+        r#"{"dependency":"2","preset":{"customright":"files/dance.gif"}}"#,
+    )
+    .unwrap();
+    (middle, selected)
+}
+
+fn sample_jpeg(color: [u8; 3]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+        .encode(&color, 1, 1, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    bytes
+}
+
+fn sample_gif() -> Vec<u8> {
+    gif_frames(2)
+}
+
+fn gif_frames(count: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let frames = (0..count).map(|index| {
+        let (ms, color) =
+            if index % 2 == 0 { (30, [0, 250, 0, 255]) } else { (70, [0, 0, 250, 255]) };
+        image::Frame::from_parts(
+            image::RgbaImage::from_pixel(2, 2, image::Rgba(color)),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(ms, 1),
+        )
+    });
+    image::codecs::gif::GifEncoder::new(&mut bytes).encode_frames(frames).unwrap();
+    bytes
+}
+
+#[test]
+fn oversized_gif_dimensions_rejected() {
+    let mut bytes = sample_gif();
+    bytes[6..8].copy_from_slice(&(super::tex::MAX_TEXTURE_EDGE as u16 + 1).to_le_bytes());
+    assert!(super::load_user_texture(&bytes).is_none());
+}
+
+#[test]
+fn gif_frame_budget_rejected() {
+    let mut bytes = gif_frames(5);
+    bytes[6..8].copy_from_slice(&4096u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&4096u16.to_le_bytes());
+    assert!(super::load_user_texture(&bytes).is_none());
+}
+
+#[test]
+fn preset_images_bind_materials() {
+    let root = tempfile::tempdir().unwrap();
+    let (middle, selected) = image_presets(root.path());
+    std::fs::create_dir(middle.join("files")).unwrap();
+    std::fs::create_dir(selected.join("files")).unwrap();
+    std::fs::write(middle.join("files/über.jpeg"), sample_jpeg([240, 20, 10])).unwrap();
+    std::fs::write(selected.join("files/dance.gif"), sample_gif()).unwrap();
+    let model = super::load_from_dir(&image_package(), &selected).unwrap();
+    assert!(model.skipped.is_empty(), "{:?}", model.skipped);
+    let left = &model.layers[0].texture;
+    assert_eq!((left.width, left.height), (1, 1));
+    assert!(left.pixels.base_rgba().unwrap()[0] > 100);
+    let right = &model.layers[1].texture;
+    assert_eq!((right.width, right.height), (2, 2));
+    assert_eq!((right.frames.len(), right.pages.len()), (2, 1));
+    assert_eq!(right.frames.iter().map(|frame| frame.time).collect::<Vec<_>>(), [0.03, 0.07]);
+    assert!(right.pixels.base_rgba().unwrap()[1] > 200);
+    assert!(right.pages[0].base_rgba().unwrap()[2] > 200);
+}
+
+#[test]
+fn selected_image_wins_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let (middle, selected) = image_presets(root.path());
+    std::fs::create_dir(middle.join("files")).unwrap();
+    std::fs::create_dir(selected.join("files")).unwrap();
+    std::fs::write(middle.join("files/über.jpeg"), sample_jpeg([240, 20, 10])).unwrap();
+    std::fs::write(selected.join("files/über.jpeg"), sample_jpeg([10, 20, 240])).unwrap();
+    std::fs::write(
+        selected.join("project.json"),
+        r#"{"dependency":"2","preset":{"customleft":"files/über.jpeg"}}"#,
+    )
+    .unwrap();
+    let model = super::load_from_dir(&image_package(), &selected).unwrap();
+    assert!(model.layers[0].texture.pixels.base_rgba().unwrap()[2] > 100);
+}
+
+#[test]
+fn empty_image_uses_default() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, selected) = image_presets(root.path());
+    std::fs::write(
+        selected.join("project.json"),
+        r#"{"dependency":"2","preset":{"customleft":""}}"#,
+    )
+    .unwrap();
+    let model = super::load_from_dir(&image_package(), &selected).unwrap();
+    assert_eq!(model.layers[0].texture.width, 4);
+}
+
+#[test]
+fn lenient_base_image_loads() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("files")).unwrap();
+    std::fs::write(root.path().join("files/picture.jpeg"), sample_jpeg([240, 20, 10])).unwrap();
+    std::fs::write(root.path().join("project.json"), r#"{"type":"scene","general":{"properties":{"customleft":{"type":"scenetexture","value":"files/picture.jpeg",},}},}"#).unwrap();
+    let model = super::load_from_dir(&image_package(), root.path()).unwrap();
+    assert_eq!(model.layers[0].texture.width, 1);
+    assert!(model.layers[0].texture.pixels.base_rgba().unwrap()[0] > 100);
+}
+
+#[test]
+fn escaped_preset_uses_default() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, selected) = image_presets(root.path());
+    std::fs::write(
+        selected.join("project.json"),
+        r#"{"dependency":"2","preset":{"customright":"../outside.gif"}}"#,
+    )
+    .unwrap();
+    std::fs::write(root.path().join("outside.gif"), sample_gif()).unwrap();
+    let model = super::load_from_dir(&image_package(), &selected).unwrap();
+    let right = &model.layers[1].texture;
+    assert_eq!((right.width, right.height), (4, 4));
+    assert!(right.frames.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_preset_uses_default() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, selected) = image_presets(root.path());
+    std::fs::create_dir(selected.join("files")).unwrap();
+    std::fs::write(root.path().join("outside.gif"), sample_gif()).unwrap();
+    std::os::unix::fs::symlink(root.path().join("outside.gif"), selected.join("files/dance.gif"))
+        .unwrap();
+    let model = super::load_from_dir(&image_package(), &selected).unwrap();
+    assert_eq!(model.layers[1].texture.width, 4);
+}
+
+#[test]
+fn oversized_preset_uses_default() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, selected) = image_presets(root.path());
+    std::fs::create_dir(selected.join("files")).unwrap();
+    let file = std::fs::File::create(selected.join("files/dance.gif")).unwrap();
+    file.set_len((super::MAX_USER_TEXTURE_FILE_BYTES + 1) as u64).unwrap();
+    let model = super::load_from_dir(&image_package(), &selected).unwrap();
+    assert_eq!(model.layers[1].texture.width, 4);
+}
 
 #[test]
 fn preset_scene_load_uses_parent_then_preset_then_explicit_properties() {
@@ -51,7 +238,13 @@ fn parallax_pushes_a_layer_away_from_the_canvas_centre_by_amount_times_depth() {
     let parallax = Parallax::of(&scene(0.5), canvas, &props).expect("enabled");
     let object = json!({"id": 1, "origin": "700 500 0", "parallaxDepth": "2 0.5"});
     let objects = [object.clone()];
-    let placed = resolve_transform(&object, &by_id(&objects), &props, Some(&parallax));
+    let placed = resolve_transform(
+        &object,
+        &by_id(&objects),
+        &props,
+        Some(&parallax),
+        &crate::model::Attachments::new(),
+    );
     assert!((placed.origin.0 - (700.0 + (700.0 - 500.0) * 0.5 * 2.0)).abs() < 1e-3);
     assert!((placed.origin.1 - (500.0 + (500.0 - 400.0) * 0.5 * 0.5)).abs() < 1e-3);
 }
@@ -65,8 +258,20 @@ fn a_layer_at_the_focus_point_and_a_layer_without_depth_do_not_move() {
     let depthless = json!({"id": 2, "origin": "700 500 0"});
     for object in [&centred, &depthless] {
         let objects = [(*object).clone()];
-        let base = resolve_transform(object, &by_id(&objects), &props, None);
-        let placed = resolve_transform(object, &by_id(&objects), &props, Some(&parallax));
+        let base = resolve_transform(
+            object,
+            &by_id(&objects),
+            &props,
+            None,
+            &crate::model::Attachments::new(),
+        );
+        let placed = resolve_transform(
+            object,
+            &by_id(&objects),
+            &props,
+            Some(&parallax),
+            &crate::model::Attachments::new(),
+        );
         assert!((placed.origin.0 - base.origin.0).abs() < 1e-3);
         assert!((placed.origin.1 - base.origin.1).abs() < 1e-3);
     }
@@ -82,8 +287,9 @@ fn a_child_inherits_the_root_ancestors_offset_and_ignores_its_own_depth() {
     let objects = [root.clone(), child.clone()];
     let map = by_id(&objects);
     assert_eq!(ancestor_chain(&child, &map).len(), 2);
-    let base = resolve_transform(&child, &map, &props, None);
-    let placed = resolve_transform(&child, &map, &props, Some(&parallax));
+    let base = resolve_transform(&child, &map, &props, None, &crate::model::Attachments::new());
+    let placed =
+        resolve_transform(&child, &map, &props, Some(&parallax), &crate::model::Attachments::new());
     assert!((placed.origin.0 - base.origin.0 - (700.0 - 500.0) * 0.5 * 2.0).abs() < 1e-3);
     assert!((placed.origin.1 - base.origin.1).abs() < 1e-3);
 }
@@ -151,15 +357,22 @@ fn hidden_script_layer_preserves_effect_source_alpha() {
         std::slice::from_ref(&layout),
         (64.0, 64.0),
         &Properties::new(),
+        &crate::model::Attachments::new(),
     )
     .remove(0)
     .unwrap();
     assert_eq!(frame.tint, [0.2, 0.4, 0.6, 0.0]);
     assert_eq!(frame.source_tint, [0.2, 0.4, 0.6, 0.5]);
     scene["objects"][0]["visible"] = json!(true);
-    let shown = super::script::frames(&scene, &[layout], (64.0, 64.0), &Properties::new())
-        .remove(0)
-        .unwrap();
+    let shown = super::script::frames(
+        &scene,
+        &[layout],
+        (64.0, 64.0),
+        &Properties::new(),
+        &crate::model::Attachments::new(),
+    )
+    .remove(0)
+    .unwrap();
     assert_eq!(shown.tint, frame.source_tint);
     assert_eq!(shown.source_tint, frame.source_tint);
 }
@@ -183,7 +396,8 @@ fn text_defaults_to_unit_depth_for_placement_and_pointer_motion() {
         json!({"id":2,"parent":1,"image":"child.json","origin":"10 0 0","parallaxDepth":"0 0"});
     let objects = [root.clone(), child.clone()];
     let map = by_id(&objects);
-    let transform = resolve_transform(&child, &map, &props, Some(&parallax));
+    let transform =
+        resolve_transform(&child, &map, &props, Some(&parallax), &crate::model::Attachments::new());
     assert_eq!(transform.origin, (810.0, 550.0, 0.0));
     let mouse = crate::mouse::Parallax { amount: 0.5, influence: 1.0, ..Default::default() };
     assert_eq!(
@@ -208,7 +422,13 @@ fn image_parallax_defaults_to_unit_depth_and_preserves_authored_depth() {
         }
         let objects = [object.clone()];
         let map = by_id(&objects);
-        let transform = resolve_transform(&object, &map, &props, Some(&parallax));
+        let transform = resolve_transform(
+            &object,
+            &map,
+            &props,
+            Some(&parallax),
+            &crate::model::Attachments::new(),
+        );
         assert_eq!(
             transform.origin,
             (700.0 + 100.0 * expected[0], 500.0 + 50.0 * expected[1], 0.0)
@@ -252,7 +472,8 @@ fn child_inherits_omitted_image_parent_depth() {
         json!({"id":2,"parent":1,"image":"child.json","origin":"10 0 0","parallaxDepth":"0 0"});
     let objects = [root, child.clone()];
     let map = by_id(&objects);
-    let transform = resolve_transform(&child, &map, &props, Some(&parallax));
+    let transform =
+        resolve_transform(&child, &map, &props, Some(&parallax), &crate::model::Attachments::new());
     assert_eq!(transform.origin, (810.0, 550.0, 0.0));
     let mouse = crate::mouse::Parallax { amount: 0.5, influence: 1.0, ..Default::default() };
     assert_eq!(

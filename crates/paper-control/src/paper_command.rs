@@ -28,6 +28,8 @@ pub struct PaperCommand {
     pub properties: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer: Option<PointerState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<Box<crate::MirrorTarget>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +103,7 @@ impl PaperCommand {
             outputs: None,
             properties: None,
             pointer: None,
+            mirror: None,
         }
     }
 
@@ -119,6 +122,7 @@ impl PaperCommand {
             outputs: None,
             properties: None,
             pointer: None,
+            mirror: None,
         }
     }
 
@@ -137,6 +141,7 @@ impl PaperCommand {
             outputs: None,
             properties: None,
             pointer: None,
+            mirror: None,
         }
     }
 
@@ -161,6 +166,7 @@ impl PaperCommand {
             pause: Some(paused),
             duck: None,
             pointer: None,
+            mirror: None,
             capture: None,
             freeze: None,
             shader: None,
@@ -185,6 +191,7 @@ impl PaperCommand {
             outputs: None,
             properties: None,
             pointer: None,
+            mirror: None,
         }
     }
 
@@ -203,6 +210,7 @@ impl PaperCommand {
             outputs: None,
             properties: None,
             pointer: None,
+            mirror: None,
         }
     }
 
@@ -221,7 +229,16 @@ impl PaperCommand {
             outputs: Some(outputs.to_vec()),
             properties: None,
             pointer: None,
+            mirror: None,
         }
+    }
+
+    pub fn mirror(output: &str, socket: &str) -> Self {
+        let mut command = Self::audio(None, None);
+        command.outputs = Some(vec![output.into()]);
+        command.mirror =
+            Some(Box::new(crate::MirrorTarget { output: output.into(), socket: socket.into() }));
+        command
     }
 
     pub fn line(&self) -> String {
@@ -231,6 +248,7 @@ impl PaperCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandClass {
+    Mirror(crate::MirrorTarget),
     Surface(crate::SurfacePolicy),
     Pointer(PointerState),
     Freeze(String),
@@ -242,6 +260,9 @@ pub enum CommandClass {
 }
 
 pub fn classify_command(command: PaperCommand) -> CommandClass {
+    if let Some(mirror) = command.mirror {
+        return CommandClass::Mirror(*mirror);
+    }
     if let Some(surface) = command.surface {
         return CommandClass::Surface(*surface);
     }

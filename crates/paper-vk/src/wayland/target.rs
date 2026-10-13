@@ -1,6 +1,9 @@
+use super::mirror::{dmabuf_layout, shm_fourcc};
 use super::model::{App, SurfaceUi, Target};
 use anyhow::{Result, anyhow};
-use wayland_client::protocol::{wl_buffer, wl_output, wl_region, wl_shm};
+use paper_geom::FillMode;
+use paper_runtime::mirror::{Layout, Memory, Plane};
+use wayland_client::protocol::{wl_buffer, wl_region, wl_shm};
 use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::content_type::v1::client::wp_content_type_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1;
@@ -51,6 +54,21 @@ fn all_surfaces_presented_after(presented: impl IntoIterator<Item = (u64, u64)>)
     presented.peek().is_some() && presented.all(|(current, checkpoint)| current > checkpoint)
 }
 
+fn viewport_crop(
+    mode: FillMode,
+    source: (u32, u32),
+    size: (u32, u32),
+    position: Option<(i32, i32)>,
+    bounds: Option<(i32, i32, u32, u32)>,
+) -> (u32, u32, u32, u32) {
+    match (mode, bounds, position) {
+        (FillMode::Span, Some(bounds), Some((x, y))) => {
+            paper_geom::span_crop_rect(source.0, source.1, bounds, (x, y, size.0, size.1))
+        }
+        _ => paper_geom::fill_crop_rect(source.0, source.1, size.0, size.1),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupBufferWait {
     Ready(usize),
@@ -78,6 +96,7 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         dmabuf_feedback_all: Vec::new(),
         dmabuf_feedback_score: 0,
         viewporter: None,
+        xdg_output_manager: None,
         content_type_manager: None,
         shm: None,
         outputs: Vec::new(),
@@ -97,8 +116,14 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         shm_formats: Vec::new(),
         probe_result: None,
         resized: false,
+        mirror_buffers: super::mirror::Buffers::default(),
     };
     queue.roundtrip(&mut app)?;
+    if let Some(manager) = &app.xdg_output_manager {
+        for (index, info) in app.outputs.iter_mut().enumerate() {
+            info.xdg_output = Some(manager.get_xdg_output(&info.output, &qh, index));
+        }
+    }
     queue.roundtrip(&mut app)?;
 
     let compositor = app.compositor.clone().ok_or_else(|| anyhow!("no wl_compositor"))?;
@@ -107,8 +132,8 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         .clone()
         .ok_or_else(|| anyhow!("no zwlr_layer_shell_v1 (wlr compositor required)"))?;
     let target = paper_control::OutputTarget::from_arg(target_output);
-    let picked: Vec<(wl_output::WlOutput, String, i32, (u32, u32))> =
-        app.outputs.iter().filter(|(_, n, ..)| target.matches(n)).cloned().collect();
+    let picked =
+        app.outputs.iter().filter(|info| target.matches(&info.name)).cloned().collect::<Vec<_>>();
     if picked.is_empty() {
         return Err(anyhow!("output '{target_output}' not found"));
     }
@@ -123,11 +148,11 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
     if input_passthrough {
         tracing::info!("skwd-wall-vk: input passthrough enabled");
     }
-    for (si, (output, name, scale, mode)) in picked.iter().enumerate() {
+    for (si, info) in picked.iter().enumerate() {
         let surface = compositor.create_surface(&qh, ());
         let layer = shell.get_layer_surface(
             &surface,
-            Some(output),
+            Some(&info.output),
             vk_layer,
             std::env::var("SKWD_PAPER_NAMESPACE").unwrap_or_else(|_| "skwd-wall-vk".into()),
             &qh,
@@ -141,7 +166,7 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         );
         layer.set_exclusive_zone(-1);
         layer.set_size(0, 0);
-        surface.set_buffer_scale(*scale);
+        surface.set_buffer_scale(info.scale);
         let input_region = if input_passthrough {
             let region = compositor.create_region(&qh, ());
             surface.set_input_region(Some(&region));
@@ -151,26 +176,31 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         };
         surface.commit();
         app.surfaces.push(SurfaceUi {
-            name: name.clone(),
+            name: info.name.clone(),
+            output: info.output.clone(),
+            position: info.position(),
             surface,
             _input_region: input_region,
             _layer: layer,
             width: 0,
             height: 0,
-            scale: *scale,
-            mode: *mode,
+            scale: info.scale,
+            mode: info.mode,
             configured: false,
             closed: false,
             free_buffers: Vec::new(),
             last_flip_ns: 0,
             refresh_ns: 0,
-            fps_limit: fps_limit(name),
+            fps_limit: fps_limit(&info.name),
             next_commit_ns: 0,
             presented: 0,
             discarded: 0,
             feedbacks: Vec::new(),
             viewport: None,
             _content_type: None,
+            source: None,
+            attached: None,
+            mirror: None,
         });
     }
 
@@ -248,6 +278,32 @@ fn desktop_is_kwin(value: &str) -> bool {
 }
 
 impl Target {
+    pub fn span_bounds(&self) -> Option<(i32, i32, u32, u32)> {
+        let surfaces = self.app.surfaces.iter().filter(|surface| {
+            surface.configured && !surface.closed && surface.width > 0 && surface.height > 0
+        });
+        let mut outputs = Vec::new();
+        for surface in surfaces {
+            let (x, y) = surface.position?;
+            outputs.push((x, y, surface.width, surface.height));
+        }
+        paper_geom::desktop_bounds(&outputs)
+    }
+
+    pub fn span_size(&self) -> Option<(u32, u32)> {
+        let (_, _, width, height) = self.span_bounds()?;
+        let scale = self
+            .app
+            .surfaces
+            .iter()
+            .filter(|surface| {
+                surface.configured && !surface.closed && surface.width > 0 && surface.height > 0
+            })
+            .map(|surface| surface.scale.max(1) as u32)
+            .max()?;
+        Some((width.saturating_mul(scale), height.saturating_mul(scale)))
+    }
+
     pub fn set_content_type(&mut self, kind: wp_content_type_v1::Type) {
         let Some(manager) = &self.app.content_type_manager else {
             return;
@@ -304,6 +360,7 @@ impl Target {
         surf.surface.set_buffer_scale(1);
         viewport.set_source(-1.0, -1.0, -1.0, -1.0);
         viewport.set_destination(surf.width as i32, surf.height as i32);
+        surf.source = None;
         Ok(())
     }
 
@@ -339,6 +396,12 @@ impl Target {
             (si, bi),
         );
         params.destroy();
+        let plane = Plane { stride, offset };
+        self.app.mirror_buffers.record(
+            &buffer,
+            &[fd],
+            dmabuf_layout(width, height, crate::dmabuf::FOURCC_XR24, modifier, &[plane]),
+        );
         self.conn.flush()?;
         Ok(buffer)
     }
@@ -503,6 +566,22 @@ impl Target {
                 &qh,
                 (si, slot),
             );
+            self.app.mirror_buffers.record(
+                &buffer,
+                &[fd],
+                Layout {
+                    width,
+                    height,
+                    fourcc: shm_fourcc(format),
+                    modifier: 0,
+                    memory: Memory::Shm,
+                    planes: [
+                        Plane { stride, offset: (slot * slot_bytes) as u32 },
+                        Plane::default(),
+                    ],
+                    plane_count: 1,
+                },
+            );
             buffers.push(buffer);
             ptrs.push(unsafe { (base as *mut u8).add(slot * slot_bytes) });
         }
@@ -513,16 +592,23 @@ impl Target {
     }
 
     pub fn set_viewport_cover(&mut self, si: usize, video_w: u32, video_h: u32) -> Result<()> {
+        let bounds = self.span_bounds();
         let viewporter = self.app.viewporter.as_ref().ok_or_else(|| anyhow!("no wp_viewporter"))?;
         let qh = self.queue.handle();
         let surf = &mut self.app.surfaces[si];
         let viewport =
             surf.viewport.get_or_insert_with(|| viewporter.get_viewport(&surf.surface, &qh, ()));
         surf.surface.set_buffer_scale(1);
-        let (x, y, width, height) =
-            paper_geom::fill_crop_rect(video_w, video_h, surf.width, surf.height);
+        let (x, y, width, height) = viewport_crop(
+            crate::fill::fill_mode(),
+            (video_w, video_h),
+            (surf.width, surf.height),
+            surf.position,
+            bounds,
+        );
         viewport.set_source(f64::from(x), f64::from(y), f64::from(width), f64::from(height));
         viewport.set_destination(surf.width as i32, surf.height as i32);
+        surf.source = Some([x, y, width, height]);
         Ok(())
     }
 
@@ -532,6 +618,7 @@ impl Target {
             viewport.destroy();
             surf.surface.set_buffer_scale(surf.scale);
         }
+        surf.source = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -564,6 +651,15 @@ impl Target {
             (si, bi),
         );
         params.destroy();
+        let planes = [
+            Plane { stride: plane0_stride, offset: plane0_offset },
+            Plane { stride: plane1_stride, offset: plane1_offset },
+        ];
+        self.app.mirror_buffers.record(
+            &buffer,
+            &[fd, fd],
+            dmabuf_layout(width, height, crate::dmabuf::FOURCC_NV12, modifier, &planes),
+        );
         self.conn.flush()?;
         Ok(buffer)
     }
@@ -602,6 +698,17 @@ impl Target {
             (si, bi),
         );
         params.destroy();
+        if plane0_modifier == plane1_modifier {
+            let planes = [
+                Plane { stride: plane0_stride, offset: plane0_offset },
+                Plane { stride: plane1_stride, offset: plane1_offset },
+            ];
+            self.app.mirror_buffers.record(
+                &buffer,
+                &[plane0_fd, plane1_fd],
+                dmabuf_layout(width, height, crate::dmabuf::FOURCC_NV12, plane0_modifier, &planes),
+            );
+        }
         self.conn.flush()?;
         Ok(buffer)
     }
@@ -652,9 +759,13 @@ impl Target {
     }
 
     pub fn attach_at(&mut self, si: usize, buffer: &wl_buffer::WlBuffer) {
-        let surf = &self.app.surfaces[si];
+        let surf = &mut self.app.surfaces[si];
         surf.surface.attach(Some(buffer), 0, 0);
         surf.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        surf.attached = Some(buffer.clone());
+        if surf.mirror.is_some() {
+            self.app.publish_mirror(si, buffer);
+        }
     }
 
     pub fn request_presentation_feedback_at(&mut self, si: usize) {
@@ -720,6 +831,7 @@ impl Target {
         range: std::ops::Range<usize>,
     ) -> Result<GroupBufferWait> {
         self.queue.dispatch_pending(&mut self.app)?;
+        self.settle_mirrors();
         Ok(self.take_free_group_buffer_in(group, range))
     }
 
@@ -822,6 +934,7 @@ impl Target {
     pub fn wait_frame(&mut self, deadline: std::time::Instant) -> Result<()> {
         loop {
             self.queue.dispatch_pending(&mut self.app)?;
+            self.settle_mirrors();
             self.conn.flush()?;
             if self.app.frame_fired || self.app.closed {
                 return Ok(());
@@ -859,6 +972,7 @@ impl Target {
     ) -> Result<()> {
         loop {
             let dispatched = self.queue.dispatch_pending(&mut self.app)?;
+            self.settle_mirrors();
             self.conn.flush()?;
             if dispatched > 0 || self.app.closed {
                 return Ok(());
@@ -883,14 +997,17 @@ impl Target {
                     },
                     libc::pollfd { fd: wake_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
                 ];
-                let nfds = 3;
-                let nready = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms.max(1)) };
+                let mut mirrors = self.mirror_pollfds();
+                let nready = poll_with(&mut pfds, &mut mirrors, timeout_ms.max(1));
                 if nready > 0 && pfds[0].revents & libc::POLLIN != 0 {
                     let _ = guard.read();
                 } else {
                     drop(guard);
                 }
-                if nready > 0 && pfds[2].revents != 0 {
+                if nready > 0
+                    && (pfds[2].revents != 0 || mirrors.iter().any(|pfd| pfd.revents != 0))
+                {
+                    self.settle_mirrors();
                     return Ok(());
                 }
                 if nready > 0 && pfds[1].revents & libc::POLLIN != 0 {
@@ -908,6 +1025,7 @@ impl Target {
     pub fn dispatch_until(&mut self, deadline: std::time::Instant) -> Result<()> {
         loop {
             self.queue.dispatch_pending(&mut self.app)?;
+            self.settle_mirrors();
             self.conn.flush()?;
             let now = std::time::Instant::now();
             if now >= deadline || self.app.closed {
@@ -916,13 +1034,14 @@ impl Target {
             let timeout_ms = deadline.duration_since(now).as_millis().min(10_000) as i32;
             if let Some(guard) = self.conn.prepare_read() {
                 use std::os::fd::AsRawFd;
-                let mut pfd = libc::pollfd {
+                let mut pfd = [libc::pollfd {
                     fd: guard.connection_fd().as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
-                };
-                let nready = unsafe { libc::poll(&mut pfd, 1, timeout_ms.max(1)) };
-                if nready > 0 {
+                }];
+                let mut mirrors = self.mirror_pollfds();
+                let nready = poll_with(&mut pfd, &mut mirrors, timeout_ms.max(1));
+                if nready > 0 && pfd[0].revents != 0 {
                     let _ = guard.read();
                 } else {
                     drop(guard);
@@ -931,8 +1050,21 @@ impl Target {
         }
     }
 
+    fn settle_mirrors(&mut self) {
+        self.app.apply_mirror_requests();
+        self.app.service_mirrors();
+    }
+
+    fn mirror_pollfds(&self) -> Vec<libc::pollfd> {
+        self.app
+            .mirror_fds()
+            .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+            .collect()
+    }
+
     pub fn pump(&mut self) -> Result<()> {
         self.queue.dispatch_pending(&mut self.app)?;
+        self.settle_mirrors();
         self.conn.flush()?;
         let Some(guard) = self.conn.prepare_read() else {
             return Ok(());
@@ -968,6 +1100,18 @@ impl Target {
         }
         Ok(())
     }
+}
+
+fn poll_with(fixed: &mut [libc::pollfd], extra: &mut [libc::pollfd], timeout_ms: i32) -> i32 {
+    if extra.is_empty() {
+        return unsafe { libc::poll(fixed.as_mut_ptr(), fixed.len() as libc::nfds_t, timeout_ms) };
+    }
+    let mut all: Vec<libc::pollfd> = fixed.iter().chain(extra.iter()).copied().collect();
+    let nready = unsafe { libc::poll(all.as_mut_ptr(), all.len() as libc::nfds_t, timeout_ms) };
+    for (slot, polled) in fixed.iter_mut().chain(extra.iter_mut()).zip(&all) {
+        slot.revents = polled.revents;
+    }
+    nready
 }
 
 impl wayland_client::Dispatch<wl_region::WlRegion, ()> for App {

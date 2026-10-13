@@ -33,7 +33,7 @@ pub(crate) fn build_pkg(files: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
-fn build_tex(
+pub(crate) fn build_tex(
     container: &str,
     format: i32,
     flags: i32,

@@ -3,6 +3,9 @@ use anyhow::{Context, Result, anyhow};
 use ash::vk;
 use paper_scene::tex::{PixelFormat, Pixels};
 
+const ALPHA_PREMULTIPLY: u32 = 1;
+const ALPHA_UNPREMULTIPLY: u32 = 2;
+
 pub struct SceneTexture {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -10,6 +13,7 @@ pub struct SceneTexture {
     pub sampler: vk::Sampler,
     set: vk::DescriptorSet,
     pub allocation_bytes: u64,
+    pub premultiplied: bool,
 }
 
 pub struct SceneTarget {
@@ -685,7 +689,15 @@ impl Renderer {
                 ],
                 &[],
             );
-            Ok(SceneTexture { image, memory, view, sampler, set, allocation_bytes: reqs.size })
+            Ok(SceneTexture {
+                image,
+                memory,
+                view,
+                sampler,
+                set,
+                allocation_bytes: reqs.size,
+                premultiplied: false,
+            })
         }
     }
 
@@ -722,6 +734,7 @@ impl Renderer {
             sampler: self.sampler,
             set,
             allocation_bytes: 0,
+            premultiplied: false,
         })
     }
 
@@ -1175,7 +1188,9 @@ impl Renderer {
                     tint: quad.tint,
                     canvas,
                     angle: quad.angle,
-                    pad: if quad.blend == SceneBlend::Screen { 1.0 } else { 0.0 },
+                    pad: ((u32::from(quad.blend == SceneBlend::Screen) * ALPHA_PREMULTIPLY)
+                        | (u32::from(texture.premultiplied) * ALPHA_UNPREMULTIPLY))
+                        as f32,
                     projection: quad.projection.unwrap_or([[0.0; 4]; 3]),
                 };
                 self.device.cmd_push_constants(

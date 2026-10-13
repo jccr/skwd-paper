@@ -1,25 +1,38 @@
+use super::model::App;
 use super::shm_pixels::choose_shm_format;
-use anyhow::{Result, anyhow};
-use smithay_client_toolkit::shm::{
-    Shm,
-    slot::{Buffer, Slot, SlotPool},
+use anyhow::Result;
+use paper_runtime::mirror::{Layout, Memory, Plane};
+use paper_runtime::shm::SharedMemory;
+use smithay_client_toolkit::shm::Shm;
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use wayland_client::{
+    Connection, Dispatch, QueueHandle,
+    protocol::{
+        wl_buffer::{self, WlBuffer},
+        wl_shm::Format,
+        wl_shm_pool::{self, WlShmPool},
+        wl_surface::WlSurface,
+    },
 };
-use wayland_client::protocol::{wl_shm::Format, wl_surface::WlSurface};
 
 pub(super) struct BufferSet {
-    pool: SlotPool,
-    slot: Slot,
-    buffers: Vec<Buffer>,
+    memory: SharedMemory,
+    pool: WlShmPool,
+    qh: QueueHandle<App>,
+    buffers: Vec<(WlBuffer, Arc<AtomicBool>)>,
+    busy: Vec<(WlBuffer, Arc<AtomicBool>)>,
     width: u32,
     height: u32,
     stride: i32,
     format: Format,
-    byte_len: usize,
 }
 
 impl BufferSet {
     pub(super) fn new(
         shm: &Shm,
+        qh: &QueueHandle<App>,
         width: u32,
         height: u32,
         surface_count: usize,
@@ -27,71 +40,70 @@ impl BufferSet {
     ) -> Result<Self> {
         let stride = (width as i32) * 4;
         let byte_len = (stride as usize) * (height as usize);
-        let pool_len = (byte_len + 63) & !63;
-        let mut pool =
-            SlotPool::new(pool_len, shm).map_err(|err| anyhow!("SlotPool::new: {err}"))?;
-        let slot = pool.new_slot(byte_len).map_err(|err| anyhow!("new_slot: {err}"))?;
+        let memory = SharedMemory::new(byte_len)?;
         let format = choose_shm_format(shm.formats());
-        fill(&mut pool.raw_data_mut(&slot)[..byte_len], format);
+        let pool = shm.wl_shm().create_pool(memory.as_fd(), byte_len.max(1) as i32, qh, ());
         let mut set = Self {
+            memory,
             pool,
-            slot,
+            qh: qh.clone(),
             buffers: Vec::with_capacity(surface_count),
+            busy: Vec::new(),
             width,
             height,
             stride,
             format,
-            byte_len,
         };
-        set.ensure_count(surface_count)?;
+        fill(set.bytes(), format);
+        set.ensure_count(surface_count);
         Ok(set)
     }
 
-    fn create_buffer(&mut self) -> Result<Buffer> {
-        self.pool
-            .create_buffer_in(
-                &self.slot,
-                self.width as i32,
-                self.height as i32,
-                self.stride,
-                self.format,
-            )
-            .map_err(|err| anyhow!("create_buffer_in: {err}"))
+    fn bytes(&mut self) -> &mut [u8] {
+        self.memory.bytes()
     }
 
-    fn ensure_count(&mut self, count: usize) -> Result<()> {
+    fn create_buffer(&self) -> (WlBuffer, Arc<AtomicBool>) {
+        let active = Arc::new(AtomicBool::new(false));
+        let buffer = self.pool.create_buffer(
+            0,
+            self.width as i32,
+            self.height as i32,
+            self.stride,
+            self.format,
+            &self.qh,
+            active.clone(),
+        );
+        (buffer, active)
+    }
+
+    fn ensure_count(&mut self, count: usize) {
         while self.buffers.len() < count {
-            let buffer = self.create_buffer()?;
+            let buffer = self.create_buffer();
             self.buffers.push(buffer);
         }
-        Ok(())
     }
 
-    pub(super) fn attach_to(&mut self, index: usize, surface: &WlSurface) -> Result<()> {
-        self.ensure_count(index + 1)?;
-        if self.buffers[index].attach_to(surface).is_ok() {
-            return Ok(());
+    pub(super) fn attach_to(&mut self, index: usize, surface: &WlSurface) {
+        self.ensure_count(index + 1);
+        self.busy.retain(|(buffer, active)| {
+            let keep = active.load(Ordering::Acquire);
+            if !keep {
+                buffer.destroy();
+            }
+            keep
+        });
+        if self.buffers[index].1.swap(true, Ordering::AcqRel) {
+            let fresh = self.create_buffer();
+            fresh.1.store(true, Ordering::Release);
+            let old = std::mem::replace(&mut self.buffers[index], fresh);
+            self.busy.push(old);
         }
-        let buffer = self.create_buffer()?;
-        buffer.attach_to(surface).map_err(|err| anyhow!("activate fresh buffer: {err}"))?;
-        self.buffers[index] = buffer;
-        Ok(())
+        surface.attach(Some(&self.buffers[index].0), 0, 0);
     }
 
     pub(super) fn drop_local_pages(&mut self) {
-        let data = self.pool.raw_data_mut(&self.slot);
-        let (start, len) = (data.as_mut_ptr() as usize, data.len());
-        if len == 0 {
-            return;
-        }
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
-        let head = start.div_ceil(page) * page;
-        let tail = (start + len) / page * page;
-        if tail > head {
-            unsafe {
-                libc::madvise(head as *mut libc::c_void, tail - head, libc::MADV_DONTNEED);
-            }
-        }
+        self.memory.drop_local_pages();
     }
 
     pub(super) fn dimensions(&self) -> (u32, u32) {
@@ -99,10 +111,66 @@ impl BufferSet {
     }
 
     pub(super) fn has_active_buffers(&self) -> bool {
-        self.slot.has_active_buffers()
+        self.buffers.iter().chain(&self.busy).any(|(_, active)| active.load(Ordering::Acquire))
     }
 
     pub(super) fn canvas(&mut self) -> Option<&mut [u8]> {
-        self.slot.canvas(&mut self.pool).map(|canvas| &mut canvas[..self.byte_len])
+        (!self.has_active_buffers()).then(|| self.bytes())
+    }
+
+    pub(super) fn share(&self) -> std::io::Result<(OwnedFd, Layout)> {
+        let fourcc = match self.format {
+            Format::Argb8888 => paper_runtime::mirror::AR24,
+            Format::Xrgb8888 => paper_runtime::mirror::XR24,
+            other => u32::from(other),
+        };
+        Ok((
+            self.memory.as_fd().try_clone_to_owned()?,
+            Layout {
+                width: self.width,
+                height: self.height,
+                fourcc,
+                modifier: 0,
+                memory: Memory::Shm,
+                planes: [Plane { stride: self.stride as u32, offset: 0 }, Plane::default()],
+                plane_count: 1,
+            },
+        ))
+    }
+}
+
+impl Drop for BufferSet {
+    fn drop(&mut self) {
+        for (buffer, _) in self.buffers.drain(..).chain(self.busy.drain(..)) {
+            buffer.destroy();
+        }
+        self.pool.destroy();
+    }
+}
+
+impl Dispatch<WlBuffer, Arc<AtomicBool>> for App {
+    fn event(
+        _: &mut Self,
+        _: &WlBuffer,
+        event: wl_buffer::Event,
+        active: &Arc<AtomicBool>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            active.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WlShmPool,
+        _: wl_shm_pool::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }

@@ -4,6 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use ffmpeg_the_third as ff;
 use std::io::Write;
 
+const VIDEO_SUFFIX: &str = ".mp4";
+
 struct Timeline {
     pts: f64,
     due: f64,
@@ -43,8 +45,7 @@ impl VideoTexture {
         clamp: bool,
         nearest: bool,
     ) -> Result<Self> {
-        let mut file =
-            tempfile::Builder::new().prefix("skwd-scene-video-").suffix(".mp4").tempfile()?;
+        let mut file = paper_runtime::scratch::file(paper_runtime::scratch::VIDEO, VIDEO_SUFFIX)?;
         file.write_all(payload).context("write embedded scene video")?;
         let path = file.path().to_str().context("scene video path")?;
         let force_software = shared::software_decode_required(sd.software, sd.queue_sync);

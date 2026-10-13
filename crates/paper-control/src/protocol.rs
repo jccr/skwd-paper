@@ -607,6 +607,7 @@ impl Request {
 
     pub fn validate(&self) -> Result<(), ValidationError> {
         match &self.params {
+            RequestParams::Mirror(request) => request.validate(),
             RequestParams::Apply(request) => request.validate(),
             RequestParams::Stop(request) => request.validate(),
             RequestParams::AudioSet(request) => request.validate(),
@@ -623,6 +624,8 @@ impl Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum RequestParams {
+    #[serde(rename = "paper.mirror")]
+    Mirror(crate::MirrorTarget),
     #[serde(rename = "paper.apply")]
     Apply(ApplyRequest),
     #[serde(rename = "paper.stop")]
@@ -720,6 +723,8 @@ pub struct AudioSetResult {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlCapabilities {
+    #[serde(default)]
+    pub mirror: bool,
     pub pause: bool,
     pub audio: bool,
     #[serde(default)]
@@ -853,7 +858,12 @@ impl CapabilitiesResult {
             video_engines: vec![VideoEngine::Default, VideoEngine::Tinier],
             fill_modes: FillMode::ALL.to_vec(),
             layers: vec![Layer::Background, Layer::Bottom, Layer::Top, Layer::Overlay],
-            controls: ControlCapabilities { pause: true, audio: true, surface_effects: true },
+            controls: ControlCapabilities {
+                mirror: true,
+                pause: true,
+                audio: true,
+                surface_effects: true,
+            },
             transitions: TransitionCapabilities {
                 startup_source_kinds: vec![SourceKind::Video, SourceKind::WallpaperEngine],
                 static_overlay: true,
@@ -964,6 +974,7 @@ pub type CapabilitiesResponse = Response<CapabilitiesResult>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    InvalidMirrorTarget,
     LoadTimeoutOutOfRange(u64),
     InvalidSurfacePolicy,
     EmptyAssignments,
@@ -1011,6 +1022,9 @@ pub enum ValidationError {
 impl Display for ValidationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidMirrorTarget => {
+                write!(formatter, "mirror requires one output and an absolute socket path")
+            }
             Self::LoadTimeoutOutOfRange(value) => {
                 write!(formatter, "load_timeout_ms must be between 3000 and 60000, got {value}")
             }

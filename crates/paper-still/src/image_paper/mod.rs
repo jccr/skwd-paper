@@ -2,6 +2,7 @@ mod buffer_set;
 mod commands;
 mod decode;
 mod lifecycle;
+mod mirror;
 mod model;
 mod protocol;
 mod readiness;

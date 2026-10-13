@@ -1,14 +1,17 @@
 use crate::backend::{BackendPaths, Worker, static_transition, transition_source};
 use anyhow::{Context, Result, anyhow};
 use paper_control::{
-    ApplyRequest, Assignment, AudioSetRequest, PaperCommand, RendererFailed, RendererPolicy,
-    RendererReady, SandScope, StopRequest, VideoEngine,
+    ApplyRequest, Assignment, AudioSetRequest, FillMode, PaperCommand, RendererFailed,
+    RendererPolicy, RendererReady, SandScope, StopRequest, VideoEngine,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+const ALL_OUTPUT: &str = "*";
+const OUTPUT_SEPARATOR: &str = ",";
 
 async fn any_worker_exit(workers: &mut [Worker]) {
     if workers.is_empty() {
@@ -159,6 +162,7 @@ impl ApplyTransaction {
 }
 
 pub(crate) struct Manager {
+    mirrors: BTreeMap<String, (String, u32)>,
     surface_override: Option<paper_control::SurfacePolicy>,
     backends: Option<BackendPaths>,
     workers: Vec<Worker>,
@@ -174,6 +178,7 @@ pub(crate) struct Manager {
 impl Manager {
     pub(crate) fn new() -> Self {
         Self {
+            mirrors: BTreeMap::new(),
             surface_override: None,
             backends: None,
             workers: Vec::new(),
@@ -190,6 +195,7 @@ impl Manager {
     #[cfg(test)]
     pub(crate) fn with_backends(backends: BackendPaths, freeze_parent: PathBuf) -> Self {
         Self {
+            mirrors: BTreeMap::new(),
             surface_override: None,
             backends: Some(backends),
             workers: Vec::new(),
@@ -237,6 +243,51 @@ impl Manager {
         Ok(())
     }
 
+    pub(crate) async fn mirror(&mut self, target: &paper_control::MirrorTarget) -> Result<()> {
+        target.validate()?;
+        if target.socket.is_empty() {
+            self.mirrors.remove(&target.output);
+        }
+        let worker = self.workers.iter_mut().find(|worker| {
+            worker.assignment.outputs.contains(&target.output)
+                || worker.assignment.outputs == [ALL_OUTPUT]
+        });
+        let Some(worker) = worker else {
+            return if target.socket.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!("no renderer for {}", target.output))
+            };
+        };
+        worker.mirror(target).await?;
+        if !target.socket.is_empty() {
+            self.mirrors.insert(target.output.clone(), (target.socket.clone(), worker.pid()));
+        }
+        Ok(())
+    }
+
+    async fn reconnect_mirrors(&mut self) {
+        for (output, (socket, pid)) in std::mem::take(&mut self.mirrors) {
+            if !paper_runtime::mirror::Link::peer_exists(Path::new(&socket)) {
+                continue;
+            }
+            let Some(worker) = self.workers.iter_mut().find(|worker| {
+                worker.assignment.outputs.contains(&output)
+                    || worker.assignment.outputs == [ALL_OUTPUT]
+            }) else {
+                continue;
+            };
+            let target = paper_control::MirrorTarget { output, socket };
+            if worker.pid() != pid
+                && let Err(error) = worker.mirror(&target).await
+            {
+                tracing::warn!(output = %target.output, %error, "Paper mirror reconnect failed");
+                continue;
+            }
+            self.mirrors.insert(target.output, (target.socket, worker.pid()));
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.workers.is_empty() && self.overlays.is_empty()
     }
@@ -254,6 +305,8 @@ impl Manager {
         for mut worker in self.overlays.drain(..) {
             if worker.exited()?.is_none() {
                 overlays.push(worker);
+            } else {
+                paper_runtime::scratch::release(worker.pid());
             }
         }
         self.overlays = overlays;
@@ -270,6 +323,7 @@ impl Manager {
                         %status,
                         "paper worker exited, assignment dropped"
                     );
+                    paper_runtime::scratch::release(worker.pid());
                 }
             }
         }
@@ -311,21 +365,55 @@ impl Manager {
         }
         let transition_primary =
             primary_sand_transition_output(policy.as_ref(), &request.assignments);
-        let mut expanded = expand(&request.assignments, transition_primary.as_deref());
-        for (assignment, output) in &mut expanded {
-            resolve_transition_from(assignment, output, &self.workers)?;
-        }
-        let touched: BTreeSet<String> = request
+        let mut assignments = request.assignments.clone();
+        let mut touched: BTreeSet<String> = request
             .assignments
             .iter()
             .flat_map(|assignment| assignment.outputs.iter().cloned())
             .collect();
         if !request.replace_all
-            && self.workers.iter().any(|worker| worker.assignment.outputs == ["*"])
-            && !touched.contains("*")
+            && self.workers.iter().any(|worker| worker.assignment.outputs == [ALL_OUTPUT])
+            && !touched.contains(ALL_OUTPUT)
         {
             return Err(anyhow!("an active wildcard assignment requires replace_all"));
         }
+        if !request.replace_all {
+            for worker in &self.workers {
+                if worker.retain_capable() || worker.assignment.outputs.len() < 2 {
+                    continue;
+                }
+                let keep = worker
+                    .assignment
+                    .outputs
+                    .iter()
+                    .filter(|output| !touched.contains(*output))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if keep.is_empty() || keep.len() == worker.assignment.outputs.len() {
+                    continue;
+                }
+                let mut assignment = worker.assignment.clone();
+                assignment.outputs = keep;
+                assignment.transition = None;
+                assignments.push(assignment);
+                touched.extend(worker.assignment.outputs.iter().cloned());
+            }
+        }
+        let mut expanded = expand(&assignments, transition_primary.as_deref());
+        for (assignment, _) in &mut expanded {
+            resolve_transition_from(assignment, &self.workers)?;
+        }
+        self.stage(expanded, touched, request.replace_all, policy, socket).await
+    }
+
+    async fn stage(
+        &mut self,
+        expanded: Vec<(Assignment, String)>,
+        touched: BTreeSet<String>,
+        replace_all: bool,
+        policy: Option<RendererPolicy>,
+        socket: &Path,
+    ) -> Result<ApplyTransaction> {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let backends = self.backend_paths();
@@ -359,7 +447,7 @@ impl Manager {
             reveal_steady: false,
             ready: BTreeSet::new(),
             touched,
-            replace_all: request.replace_all,
+            replace_all,
             generation,
             policy,
             reported_failure: None,
@@ -400,9 +488,13 @@ impl Manager {
         let mut overlays = Vec::new();
         for overlay in self.overlays.drain(..) {
             if transaction.replace_all
-                || transaction.touched.contains("*")
-                || overlay.output == "*"
-                || transaction.touched.contains(&overlay.output)
+                || transaction.touched.contains(ALL_OUTPUT)
+                || overlay.output == ALL_OUTPUT
+                || overlay
+                    .assignment
+                    .outputs
+                    .iter()
+                    .any(|output| transaction.touched.contains(output))
             {
                 overlay.stop().await;
             } else {
@@ -413,11 +505,11 @@ impl Manager {
         self.overlays = overlays;
         let mut retained = Vec::new();
         let mut retired = Vec::new();
-        let touches_all = transaction.touched.contains("*");
+        let touches_all = transaction.touched.contains(ALL_OUTPUT);
         for worker in self.workers.drain(..) {
             if transaction.replace_all
                 || touches_all
-                || worker.assignment.outputs == ["*"]
+                || worker.assignment.outputs == [ALL_OUTPUT]
                 || worker
                     .assignment
                     .outputs
@@ -435,6 +527,7 @@ impl Manager {
         for worker in retired {
             worker.stop().await;
         }
+        self.reconnect_mirrors().await;
         Ok(self.status())
     }
 
@@ -638,8 +731,8 @@ impl Manager {
     ) -> Result<(usize, Vec<WorkerStatus>)> {
         request.validate().map_err(|error| anyhow!(error.to_string()))?;
         self.refresh()?;
-        let all = request.outputs.is_empty() || request.outputs.as_slice() == ["*"];
-        if !all && self.workers.iter().any(|worker| worker.output == "*") {
+        let all = request.outputs.is_empty() || request.outputs.as_slice() == [ALL_OUTPUT];
+        if !all && self.workers.iter().any(|worker| worker.output == ALL_OUTPUT) {
             return Err(anyhow!(
                 "targeted audio is unavailable while a wildcard assignment is active"
             ));
@@ -650,7 +743,12 @@ impl Manager {
             .iter()
             .enumerate()
             .filter_map(|(index, worker)| {
-                (all || wanted.contains(worker.output.as_str())).then_some(index)
+                (all || worker
+                    .assignment
+                    .outputs
+                    .iter()
+                    .any(|output| wanted.contains(output.as_str())))
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         let previous = targets
@@ -690,7 +788,8 @@ impl Manager {
     }
 
     pub(crate) async fn stop(&mut self, request: &StopRequest) -> Result<usize> {
-        let all = request.outputs.is_empty() || request.outputs.iter().any(|output| output == "*");
+        let all =
+            request.outputs.is_empty() || request.outputs.iter().any(|output| output == ALL_OUTPUT);
         let wanted: BTreeSet<&str> = request.outputs.iter().map(String::as_str).collect();
         let mut changes = Vec::new();
         let mut count = 0;
@@ -716,7 +815,7 @@ impl Manager {
         let mut stopped = Vec::new();
         for worker in self.workers.drain(..) {
             if all
-                || worker.assignment.outputs == ["*"]
+                || worker.assignment.outputs == [ALL_OUTPUT]
                 || worker.assignment.outputs.iter().all(|output| wanted.contains(output.as_str()))
             {
                 stopped.push(worker);
@@ -733,18 +832,64 @@ impl Manager {
         }
         let mut overlays = Vec::new();
         for overlay in self.overlays.drain(..) {
-            if all || overlay.output == "*" || wanted.contains(overlay.output.as_str()) {
+            if all
+                || overlay.output == ALL_OUTPUT
+                || overlay.assignment.outputs.iter().any(|output| wanted.contains(output.as_str()))
+            {
                 overlay.stop().await;
             } else {
                 overlays.push(overlay);
             }
         }
         self.overlays = overlays;
+        self.reconnect_mirrors().await;
         Ok(count)
     }
 
+    pub(crate) async fn begin_stop(
+        &mut self,
+        request: &StopRequest,
+        socket: &Path,
+    ) -> Result<Option<(ApplyTransaction, usize)>> {
+        if request.outputs.is_empty() || request.outputs.iter().any(|output| output == ALL_OUTPUT) {
+            return Ok(None);
+        }
+        self.refresh()?;
+        let wanted: BTreeSet<String> = request.outputs.iter().cloned().collect();
+        let mut touched = wanted.clone();
+        let mut expanded = Vec::new();
+        let mut count = 0;
+        for worker in &self.workers {
+            let keep = worker
+                .assignment
+                .outputs
+                .iter()
+                .filter(|output| !wanted.contains(*output))
+                .cloned()
+                .collect::<Vec<_>>();
+            count += worker.assignment.outputs.len() - keep.len();
+            if worker.retain_capable()
+                || keep.is_empty()
+                || keep.len() == worker.assignment.outputs.len()
+            {
+                continue;
+            }
+            let mut assignment = worker.assignment.clone();
+            let output = keep.join(OUTPUT_SEPARATOR);
+            assignment.outputs = keep;
+            assignment.transition = None;
+            expanded.push((assignment, output));
+            touched.extend(worker.assignment.outputs.iter().cloned());
+        }
+        if expanded.is_empty() {
+            return Ok(None);
+        }
+        let transaction = self.stage(expanded, touched, false, self.policy.clone(), socket).await?;
+        Ok(Some((transaction, count)))
+    }
+
     async fn retain_untouched(&mut self, transaction: &ApplyTransaction) -> Result<()> {
-        if transaction.replace_all || transaction.touched.contains("*") {
+        if transaction.replace_all || transaction.touched.contains(ALL_OUTPUT) {
             return Ok(());
         }
         let mut changes = Vec::new();
@@ -791,23 +936,20 @@ fn worker_outputs(workers: &[Worker]) -> BTreeSet<String> {
     workers.iter().flat_map(|worker| worker.assignment.outputs.iter().cloned()).collect()
 }
 
-fn resolve_transition_from(
-    assignment: &mut Assignment,
-    output: &str,
-    workers: &[Worker],
-) -> Result<()> {
-    let Some(transition) = &mut assignment.transition else {
-        return Ok(());
-    };
-    if transition.from.is_some() {
+fn resolve_transition_from(assignment: &mut Assignment, workers: &[Worker]) -> Result<()> {
+    if assignment.transition.as_ref().is_none_or(|transition| transition.from.is_some()) {
         return Ok(());
     }
     let incumbents = workers
         .iter()
         .filter(|worker| {
-            output == "*"
-                || worker.assignment.outputs == ["*"]
-                || worker.assignment.outputs.iter().any(|candidate| candidate == output)
+            assignment.outputs == [ALL_OUTPUT]
+                || worker.assignment.outputs == [ALL_OUTPUT]
+                || worker
+                    .assignment
+                    .outputs
+                    .iter()
+                    .any(|candidate| assignment.outputs.contains(candidate))
         })
         .collect::<Vec<_>>();
     if incumbents.is_empty() {
@@ -815,14 +957,27 @@ fn resolve_transition_from(
     }
     let mut paths = BTreeSet::new();
     for incumbent in incumbents {
-        paths.insert(transition_source(&incumbent.assignment.source)?);
+        match transition_source(&incumbent.assignment.source) {
+            Ok(path) => {
+                paths.insert(path);
+            }
+            Err(_) if assignment.fill_mode == FillMode::Span => {
+                assignment.transition = None;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     }
     if paths.len() != 1 {
-        return Err(anyhow!(
-            "wildcard transition requires an explicit from hint when incumbents differ"
-        ));
+        if assignment.fill_mode == FillMode::Span {
+            assignment.transition = None;
+            return Ok(());
+        }
+        return Err(anyhow!("transition requires an explicit from hint when incumbents differ"));
     }
-    transition.from = paths.into_iter().next();
+    if let Some(transition) = &mut assignment.transition {
+        transition.from = paths.into_iter().next();
+    }
     Ok(())
 }
 
@@ -963,12 +1118,21 @@ fn expand(
             {
                 assignment.transition = None;
             }
-            if assignment.source.effective_video_engine() == Some(VideoEngine::Tinier)
+            if (assignment.source.effective_video_engine() == Some(VideoEngine::Tinier)
+                || assignment.fill_mode == FillMode::Span)
+                && output != "*"
                 && let Some((group, target)) =
                     expanded.iter_mut().find(|(candidate, _)| same_renderer(candidate, &assignment))
             {
+                if group.transition != assignment.transition {
+                    group.transition = None;
+                }
+                if !assignment.mute {
+                    group.mute = false;
+                    group.volume = assignment.volume;
+                }
                 group.outputs.push(output.clone());
-                *target = group.outputs.join(",");
+                *target = group.outputs.join(OUTPUT_SEPARATOR);
                 continue;
             }
             expanded.push((assignment, output.clone()));
@@ -981,10 +1145,13 @@ fn same_renderer(left: &Assignment, right: &Assignment) -> bool {
     left.source == right.source
         && left.fill_mode == right.fill_mode
         && left.background == right.background
-        && left.mute == right.mute
-        && left.volume == right.volume
+        && (if left.fill_mode == FillMode::Span {
+            left.mute || right.mute || left.volume == right.volume
+        } else {
+            left.mute == right.mute && left.volume == right.volume
+        })
         && left.layer == right.layer
-        && left.transition == right.transition
+        && (left.fill_mode == FillMode::Span || left.transition == right.transition)
 }
 
 async fn retarget(worker: &mut Worker, outputs: &[String]) -> Result<()> {
@@ -993,7 +1160,7 @@ async fn retarget(worker: &mut Worker, outputs: &[String]) -> Result<()> {
     }
     worker.send(&PaperCommand::retain_outputs(outputs)).await?;
     worker.assignment.outputs = outputs.to_vec();
-    worker.output = outputs.join(",");
+    worker.output = outputs.join(OUTPUT_SEPARATOR);
     Ok(())
 }
 

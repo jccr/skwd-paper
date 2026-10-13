@@ -9,6 +9,7 @@ description = "Process and observability support shared by standalone wallpaper 
 
 [dependencies]
 libc = "0.2"
+tempfile = { workspace = true }
 tracing = { workspace = true }
 paper-log = { path = "../paper-log" }
 

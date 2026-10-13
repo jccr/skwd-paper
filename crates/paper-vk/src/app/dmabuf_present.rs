@@ -1211,11 +1211,19 @@ fn run_shared_dmabuf_with_readiness(
         .filter(|count| (2..=4).contains(count))
         .unwrap_or(2);
     let mut force_linear_xr24 = std::env::var("SKWD_VK_XR24_LINEAR").as_deref() == Ok("1");
-    let reuse_supported =
-        target.supports_viewporter() && !shm_present && matches!(fill_mode(), FillMode::Fill);
+    let span = (fill_mode() == FillMode::Span).then(|| target.span_size()).flatten().map(
+        |(width, height)| {
+            let limit = unsafe { sd.instance.get_physical_device_properties(sd.phys) }
+                .limits
+                .max_image_dimension2_d;
+            paper_geom::fit_scaled_size(width, height, width.min(limit), height.min(limit))
+        },
+    );
+    let reuse_supported = target.supports_viewporter()
+        && (span.is_some() || (!shm_present && fill_mode() == FillMode::Fill));
     let mut render_dims =
-        xr_render_dims(&dims, reuse_source_dims, reuse_mode.as_deref(), reuse_supported);
-    let mut reuse_export = render_dims != dims;
+        xr_render_dims(&dims, reuse_source_dims, reuse_mode.as_deref(), reuse_supported, span);
+    let mut reuse_export = render_dims != dims || (span.is_some() && reuse_supported);
     let mut output_state = build_shared_outputs(
         sd,
         &render_dims,
@@ -1227,7 +1235,7 @@ fn run_shared_dmabuf_with_readiness(
     )?;
     if !shm_present {
         let mut accepted = probe_shared_output(target, &output_state)?;
-        if !accepted && reuse_export {
+        if !accepted && reuse_export && span.is_none() {
             tracing::info!("skwd-wall-vk: compositor rejected shared export, using native extents");
             render_dims.clone_from(&dims);
             reuse_export = false;
@@ -1286,7 +1294,7 @@ fn run_shared_dmabuf_with_readiness(
             .collect::<Result<_>>()?;
         let mut bufs = Vec::with_capacity(n_surf);
         let mut rings = Vec::with_capacity(n_surf);
-        for (si, &(w, h)) in dims.iter().enumerate() {
+        for (si, &(w, h)) in render_dims.iter().enumerate() {
             let (ring, ptrs, stride) = target.create_shm_ring(si, w, h, n_exports)?;
             bufs.push(ring);
             rings.push((ptrs, stride));
@@ -1906,7 +1914,7 @@ fn run_shared_dmabuf_with_readiness(
                     rings,
                     rbs,
                     &distinct,
-                    &dims,
+                    &render_dims,
                 )?;
             }
             target.request_frame_at(anchor);
@@ -1929,7 +1937,7 @@ fn run_shared_dmabuf_with_readiness(
                     rings,
                     rbs,
                     &distinct,
-                    &dims,
+                    &render_dims,
                 )?;
             }
             if let Some(bi) = nv_bi {

@@ -75,6 +75,14 @@ impl Worker {
         self.send_line(&command.line()).await
     }
 
+    pub(crate) async fn mirror(&mut self, target: &paper_control::MirrorTarget) -> Result<()> {
+        if self.dynamic() {
+            self.send(&PaperCommand::mirror(&target.output, &target.socket)).await
+        } else {
+            self.send_line(&StillCommand::mirror(&target.output, &target.socket).line()).await
+        }
+    }
+
     pub(crate) async fn set_surface(
         &mut self,
         surface: &paper_control::SurfacePolicy,
@@ -104,7 +112,13 @@ impl Worker {
         stdin.flush().await.context("flush Paper worker command")
     }
 
-    pub(crate) async fn stop(mut self) {
+    pub(crate) async fn stop(self) {
+        let pid = self.pid;
+        self.halt().await;
+        paper_runtime::scratch::release(pid);
+    }
+
+    async fn halt(mut self) {
         self.stdin.take();
         if matches!(tokio::time::timeout(EXIT_GRACE, self.child.wait()).await, Ok(Ok(_))) {
             return;
@@ -119,7 +133,13 @@ impl Worker {
         let _ = self.child.wait().await;
     }
 
-    pub(crate) fn stop_blocking(mut self) {
+    pub(crate) fn stop_blocking(self) {
+        let pid = self.pid;
+        self.halt_blocking();
+        paper_runtime::scratch::release(pid);
+    }
+
+    fn halt_blocking(mut self) {
         self.stdin.take();
         if wait_for_exit(&mut self.child, EXIT_GRACE) {
             return;

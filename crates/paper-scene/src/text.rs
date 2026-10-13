@@ -9,6 +9,18 @@ pub(crate) mod system_font;
 
 pub const EM_PER_POINT: f32 = 300.0 / 72.0;
 pub const FALLBACK_FONT: &str = "fonts/NotoSans-Regular.ttf";
+const TEXT_INPUT_KIND: &str = "textinput";
+const PROPERTIES_PATH: &str = "/general/properties";
+const OBJECTS_FIELD: &str = "objects";
+const TEXT_FIELD: &str = "text";
+const USER_FIELD: &str = "user";
+const TYPE_FIELD: &str = "type";
+const VALUE_FIELD: &str = "value";
+const LIMIT_WIDTH_FIELD: &str = "limitwidth";
+const MAX_WIDTH_FIELD: &str = "maxwidth";
+const LIMIT_ROWS_FIELD: &str = "limitrows";
+const MAX_ROWS_FIELD: &str = "maxrows";
+const LINE_BREAK: &str = "\n";
 const MAX_TEXT_EDGE: u32 = 8192;
 const MAX_TEXT_CHARS: usize = 4096;
 
@@ -149,6 +161,125 @@ pub fn text_value(value: Option<&Value>) -> Option<String> {
         Value::Object(map) => text_value(map.get("value")),
         _ => None,
     }
+}
+
+pub(crate) fn bind_user_values(scene: &mut Value, project: &Value) {
+    let Some(declarations) = project.pointer(PROPERTIES_PATH).and_then(Value::as_object) else {
+        return;
+    };
+    let Some(objects) = scene.get_mut(OBJECTS_FIELD).and_then(Value::as_array_mut) else {
+        return;
+    };
+    for object in objects {
+        let Some(text) = object.get_mut(TEXT_FIELD).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(name) = text.get(USER_FIELD).and_then(Value::as_str) else {
+            continue;
+        };
+        let selected = declarations
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.get(TYPE_FIELD).and_then(Value::as_str) == Some(TEXT_INPUT_KIND))
+            .and_then(|entry| entry.get(VALUE_FIELD))
+            .and_then(Value::as_str);
+        if let Some(value) = selected {
+            text.insert(
+                VALUE_FIELD.into(),
+                Value::String(value.chars().take(MAX_TEXT_CHARS).collect()),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TextLimits {
+    width: Option<f32>,
+    rows: Option<usize>,
+}
+
+impl TextLimits {
+    fn of(object: &Value, props: &Properties) -> Self {
+        let width = object
+            .get(LIMIT_WIDTH_FIELD)
+            .and_then(Value::as_bool)
+            .filter(|enabled| *enabled)
+            .map(|_| crate::model::number(object.get(MAX_WIDTH_FIELD), props, MAX_TEXT_EDGE as f32))
+            .filter(|width| width.is_finite() && *width > 0.0)
+            .map(|width| width.min(MAX_TEXT_EDGE as f32));
+        let rows = object
+            .get(LIMIT_ROWS_FIELD)
+            .and_then(Value::as_bool)
+            .filter(|enabled| *enabled)
+            .map(|_| crate::model::number(object.get(MAX_ROWS_FIELD), props, MAX_TEXT_CHARS as f32))
+            .filter(|rows| rows.is_finite() && *rows > 0.0)
+            .map(|rows| rows.min(MAX_TEXT_CHARS as f32) as usize);
+        Self { width, rows }
+    }
+
+    fn apply(self, face: &Face, text: &str) -> String {
+        wrap_text(text, self.width, self.rows, |line| {
+            let (left, right) = face.line_box(line);
+            right - left
+        })
+    }
+}
+
+fn wrap_text(
+    text: &str,
+    width: Option<f32>,
+    rows: Option<usize>,
+    measure: impl Fn(&str) -> f32,
+) -> String {
+    if rows == Some(0) {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    for source in text.split('\n') {
+        let Some(width) = width else {
+            if push_line(&mut lines, source.to_owned(), rows) {
+                return lines.join(LINE_BREAK);
+            }
+            continue;
+        };
+        let mut line = String::new();
+        for word in source.split_inclusive(' ') {
+            let before = line.len();
+            line.push_str(word);
+            if before > 0 && measure(line.trim_end()) > width {
+                let remainder = line.split_off(before);
+                if push_line(&mut lines, line.trim_end().to_owned(), rows) {
+                    return lines.join(LINE_BREAK);
+                }
+                remainder.trim_start().clone_into(&mut line);
+            }
+            while measure(line.trim_end()) > width {
+                let split = line
+                    .char_indices()
+                    .map(|(index, ch)| index + ch.len_utf8())
+                    .take_while(|end| measure(line[..*end].trim_end()) <= width)
+                    .last()
+                    .unwrap_or_else(|| line.chars().next().map_or(0, char::len_utf8));
+                if split == line.len() {
+                    break;
+                }
+                if push_line(&mut lines, line[..split].trim_end().to_owned(), rows) {
+                    return lines.join(LINE_BREAK);
+                }
+                line = line[split..].trim_start().to_owned();
+            }
+        }
+        if push_line(&mut lines, line.trim_end().to_owned(), rows) {
+            return lines.join(LINE_BREAK);
+        }
+    }
+    lines.join(LINE_BREAK)
+}
+
+fn push_line(lines: &mut Vec<String>, line: String, rows: Option<usize>) -> bool {
+    lines.push(line);
+    rows.is_some_and(|rows| lines.len() >= rows)
 }
 
 fn font_bytes(pkg: &Package, assets: &Assets, name: &str) -> Option<Vec<u8>> {
@@ -345,6 +476,7 @@ pub fn render(
     let font_name = object.get("font").and_then(Value::as_str).unwrap_or("");
     let bytes = font_bytes(pkg, assets, font_name)?;
     let face = Face::parse(&bytes, em)?;
+    let text = TextLimits::of(object, props).apply(&face, &text);
     let halign = halign_of(object.get("horizontalalign"));
     let valign = valign_of(object.get("verticalalign"));
     let (metrics, texture) = face.rasterize(&text, halign)?;

@@ -36,3 +36,18 @@ fn reveal_is_explicit_and_legacy_commands_remain_unchanged() {
     }
     assert!(serde_json::from_str::<StillCommand>(r#"{"reveal":"true"}"#).is_err());
 }
+
+#[test]
+fn mirror_target_shape() {
+    let start = StillCommand::mirror("DP-1", "/run/user/1000/skwd-mini-lock/DP-1.sock");
+    assert_eq!(
+        start.line(),
+        "{\"path\":\"\",\"mirror\":{\"output\":\"DP-1\",\"socket\":\"/run/user/1000/skwd-mini-lock/DP-1.sock\"}}\n"
+    );
+    assert_eq!(serde_json::from_str::<StillCommand>(&start.line()).unwrap(), start);
+    let stop: StillCommand = serde_json::from_str(r#"{"mirror":{"output":"DP-1"}}"#).unwrap();
+    assert_eq!(stop.mirror.unwrap().socket, "");
+    assert!(
+        serde_json::from_str::<StillCommand>(r#"{"path":"/w/a.png"}"#).unwrap().mirror.is_none()
+    );
+}

@@ -23,6 +23,10 @@ use std::io::Write;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
+const SCENE_LIMIT_ENV: &str = "SKWD_VK_SCENE_MAX";
+const SCENE_DEFAULT_LIMIT: u32 = 4096;
+const SCENE_MIN_LIMIT: u32 = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SceneFadeStep {
     mix: f32,
@@ -210,7 +214,9 @@ fn animation_frame(
 }
 
 struct PuppetGroup {
+    id: String,
     puppet: paper_scene::model::Puppet,
+    pose: paper_scene::puppet::Frame,
     mesh: vk::SceneMesh,
     target: vk::SceneTarget,
     texture: usize,
@@ -1791,11 +1797,13 @@ impl Group {
         (out, draws)
     }
 
-    fn puppet_frame(&mut self, time: f32, batched: bool) -> Result<()> {
+    fn puppet_frame(&mut self, batched: bool) -> Result<()> {
         for puppet in &mut self.puppets {
-            let positions =
-                paper_scene::puppet::skin(&puppet.puppet.mesh, &puppet.puppet.layers, time);
-            self.renderer.update_scene_mesh(&puppet.mesh, &positions, puppet.puppet.size)?;
+            self.renderer.update_scene_mesh(
+                &puppet.mesh,
+                &puppet.pose.positions,
+                puppet.puppet.size,
+            )?;
             let texture = self
                 .textures
                 .get(puppet.texture)
@@ -1831,6 +1839,10 @@ impl Group {
         self.advance_live_text(time)?;
         self.advance_audio(dt);
         self.advance_media()?;
+        for puppet in &mut self.puppets {
+            puppet.pose =
+                paper_scene::puppet::skin(&puppet.puppet.mesh, &puppet.puppet.layers, time);
+        }
         self.advance_scripts(time, dt)?;
         self.advance_layer_animations(time);
         self.advance_mouse(dt);
@@ -1839,7 +1851,7 @@ impl Group {
         if batched {
             self.renderer.begin_scene_batch()?;
         }
-        self.puppet_frame(time, batched)?;
+        self.puppet_frame(batched)?;
         let (particle_quads, particle_draws) = self.particle_quads(time, dt);
         if self.fx.is_empty() {
             let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
@@ -2784,13 +2796,16 @@ fn bounded_effect_dimensions(raw_w: f64, raw_h: f64) -> (u32, u32) {
     (width, height)
 }
 
-fn scene_dimensions(model: &SceneModel, outputs: &[(u32, u32)], mode: FillMode) -> SceneDimensions {
-    let limit = std::env::var("SKWD_VK_SCENE_MAX")
+fn scene_limit() -> u32 {
+    std::env::var(SCENE_LIMIT_ENV)
         .ok()
         .and_then(|text| text.parse::<u32>().ok())
-        .unwrap_or(4096)
-        .max(256);
-    let dimensions = scene_dimensions_for_outputs(model.canvas, limit, outputs, mode);
+        .unwrap_or(SCENE_DEFAULT_LIMIT)
+        .max(SCENE_MIN_LIMIT)
+}
+
+fn scene_dimensions(model: &SceneModel, outputs: &[(u32, u32)], mode: FillMode) -> SceneDimensions {
+    let dimensions = scene_dimensions_for_outputs(model.canvas, scene_limit(), outputs, mode);
     if dimensions.raster.0 < dimensions.logical[0].round() as u32
         || dimensions.raster.1 < dimensions.logical[1].round() as u32
     {
@@ -2943,13 +2958,14 @@ fn create_puppets(
                 return Err(err).with_context(|| format!("puppet target for {}", layer.name));
             }
         };
-        let slot = match renderer.create_view_slot() {
+        let mut slot = match renderer.create_view_slot() {
             Ok(slot) => slot,
             Err(err) => {
                 renderer.destroy_scene_target(output);
                 return Err(err).with_context(|| format!("puppet slot for {}", layer.name));
             }
         };
+        slot.premultiplied = true;
         renderer.point_slot_at(&slot, output.view);
         layer_slots[index] = textures.len();
         textures.push(slot);
@@ -2961,7 +2977,16 @@ fn create_puppets(
             indices = puppet.mesh.indices.len(),
             "skwd-wall-vk: assembled puppet mesh"
         );
-        outputs.push(PuppetGroup { puppet, mesh, target: output, texture, layer: index });
+        let pose = paper_scene::puppet::skin(&puppet.mesh, &puppet.layers, 0.0);
+        outputs.push(PuppetGroup {
+            id: layer.id.clone(),
+            puppet,
+            pose,
+            mesh,
+            target: output,
+            texture,
+            layer: index,
+        });
     }
     Ok(outputs)
 }
@@ -4158,10 +4183,7 @@ fn stage_clip(clip: &str, bytes: &[u8]) -> Result<tempfile::NamedTempFile> {
             !ext.is_empty() && ext.len() <= 8 && ext.bytes().all(|b| b.is_ascii_alphanumeric())
         })
         .map_or_else(String::new, |ext| format!(".{ext}"));
-    let mut file = tempfile::Builder::new()
-        .prefix("skwd-wall-scene-audio-")
-        .suffix(&suffix)
-        .tempfile()
+    let mut file = paper_runtime::scratch::file(paper_runtime::scratch::AUDIO, &suffix)
         .context("create native scene audio file")?;
     file.write_all(bytes).context("extract native scene audio")?;
     file.flush().context("flush native scene audio")?;
@@ -4256,15 +4278,25 @@ pub(super) fn run_scene(
     let dims: Vec<(u32, u32)> = (0..n_surf).map(|si| target.size_at(si)).collect();
     let n_exports = 2usize;
     let mode = fill_mode();
-    let mut group = build_group(&sd, &mut model, strict, &dims, mode)?;
+    let composition_dims = if mode == FillMode::Span {
+        target.span_size().map_or_else(|| dims.clone(), |size| vec![size])
+    } else {
+        dims.clone()
+    };
+    let mut group = build_group(&sd, &mut model, strict, &composition_dims, mode)?;
     drop(model);
     let shared_composition = target.supports_viewporter()
         && matches!(mode, FillMode::Fill | FillMode::Stretch | FillMode::Span);
-    let (presenter_dims, mut ridx) = scene_presenter_layout(
-        &dims,
-        (group.target.extent.width, group.target.extent.height),
-        shared_composition,
-    );
+    let canvas = (group.target.extent.width, group.target.extent.height);
+    let presentation_size = if mode == FillMode::Span {
+        target.span_size().map_or(canvas, |(width, height)| {
+            scene_dimensions_for((width as f32, height as f32), scene_limit()).raster
+        })
+    } else {
+        canvas
+    };
+    let (presenter_dims, mut ridx) =
+        scene_presenter_layout(&dims, presentation_size, shared_composition);
     tracing::info!(
         outputs = n_surf,
         output_dimensions = ?dims,
@@ -4372,11 +4404,7 @@ pub(super) fn run_scene(
     for si in 0..n_surf {
         if !target.app.surfaces[si].closed {
             if shared_composition && matches!(fill_mode(), FillMode::Fill | FillMode::Span) {
-                target.set_viewport_cover(
-                    si,
-                    group.target.extent.width,
-                    group.target.extent.height,
-                )?;
+                target.set_viewport_cover(si, presentation_size.0, presentation_size.1)?;
             } else {
                 target.set_viewport_dst(si)?;
             }
@@ -4518,7 +4546,7 @@ pub(super) fn run_scene(
                 continue;
             }
             let load_ms = swap_started.elapsed().as_millis();
-            let next_group = match build_group(&sd, &mut next, strict, &dims, mode) {
+            let next_group = match build_group(&sd, &mut next, strict, &composition_dims, mode) {
                 Ok(built) => built,
                 Err(error) => {
                     signal_swap_failure(&req.to, &format!("{error:#}"));

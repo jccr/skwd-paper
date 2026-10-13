@@ -98,7 +98,7 @@ fn translucent_puppet() -> anyhow::Result<paper_scene::puppet::Mesh> {
 
 #[test]
 #[ignore = "requires a Vulkan device; run explicitly on the renderer qualification host"]
-fn puppet_intermediate_preserves_straight_alpha_colors() -> anyhow::Result<()> {
+fn puppet_alpha_roundtrip() -> anyhow::Result<()> {
     let shared = crate::shared::create(std::ptr::null_mut())?;
     let mut renderer = Renderer::new_shared_headless(
         (
@@ -113,22 +113,73 @@ fn puppet_intermediate_preserves_straight_alpha_colors() -> anyhow::Result<()> {
         4,
     )?;
     renderer.ensure_scene_pipelines()?;
-    renderer.ensure_scene_pool(1)?;
-    let texture = renderer.create_scene_texture(1, 1, &[200, 100, 50, 128])?;
+    renderer.ensure_scene_pool(5)?;
+    let composite = renderer.create_scene_target(4, 4)?;
     let target = renderer.create_scene_target(4, 4)?;
-    let mesh = renderer.create_scene_mesh(&translucent_puppet()?, (4.0, 4.0))?;
+    let mut slot = renderer.create_view_slot()?;
+    slot.premultiplied = true;
+    renderer.point_slot_at(&slot, composite.view);
+    let quad = crate::vk::SceneQuad {
+        rect: [2.0, 2.0, 4.0, 4.0],
+        uv: [0.0, 0.0, 1.0, 1.0],
+        tint: [1.0; 4],
+        angle: 0.0,
+        projection: None,
+        order_bias: 0,
+        texture: 0,
+        blend: crate::vk::SceneBlend::Copy,
+    };
+    let cases = [
+        ([200, 100, 50, 0, 40, 80, 240, 0], [0, 0, 0, 0]),
+        ([200, 100, 50, 128, 40, 80, 240, 0], [200, 100, 50, 128]),
+        ([200, 100, 50, 255, 40, 80, 240, 0], [200, 100, 50, 255]),
+        ([200, 100, 50, 128, 40, 80, 240, 128], [93, 86, 177, 192]),
+    ];
+    let mut puppet = translucent_puppet()?;
+    for vertex in &mut puppet.vertices {
+        vertex.uv = [0.25, 0.5];
+    }
+    let overlay = puppet
+        .vertices
+        .iter()
+        .map(|vertex| {
+            let mut vertex = *vertex;
+            vertex.uv = [0.75, 0.5];
+            vertex
+        })
+        .collect::<Vec<_>>();
+    puppet.vertices.extend(overlay);
+    puppet.indices.extend([4, 5, 6, 6, 7, 4]);
+    let mesh = renderer.create_scene_mesh(&puppet, (4.0, 4.0))?;
     let result = (|| {
-        renderer.render_scene_mesh(&target, &texture, &mesh)?;
-        let (width, height, pixels) = renderer.read_scene_target(&target)?;
-        anyhow::ensure!((width, height) == (4, 4), "unexpected dimensions");
-        for pixel in pixels.chunks_exact(4) {
-            let actual = [pixel[0], pixel[1], pixel[2], pixel[3]];
-            anyhow::ensure!(actual == [200, 100, 50, 128], "puppet RGBA changed: {actual:?}");
+        for (pixels, expected) in cases {
+            let texture = renderer.create_scene_texture(2, 1, &pixels)?;
+            let rendered = renderer.render_scene_mesh(&composite, &texture, &mesh);
+            renderer.destroy_scene_texture(texture);
+            rendered?;
+            renderer.render_scene(
+                &target,
+                [0.0; 4],
+                std::slice::from_ref(&quad),
+                std::slice::from_ref(&slot),
+            )?;
+            let (width, height, pixels) = renderer.read_scene_target(&target)?;
+            anyhow::ensure!((width, height) == (4, 4), "unexpected dimensions");
+            for pixel in pixels.chunks_exact(4) {
+                anyhow::ensure!(
+                    pixel
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual.abs_diff(expected) <= 2),
+                    "puppet RGBA {pixel:?} != {expected:?}"
+                );
+            }
         }
         Ok(())
     })();
     renderer.destroy_scene_mesh(mesh);
+    renderer.destroy_scene_target(composite);
     renderer.destroy_scene_target(target);
-    renderer.destroy_scene_texture(texture);
+    renderer.destroy_scene_texture(slot);
     result
 }

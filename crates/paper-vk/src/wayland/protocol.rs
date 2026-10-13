@@ -1,4 +1,4 @@
-use super::model::App;
+use super::model::{App, OutputInfo};
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface,
@@ -25,10 +25,17 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::{self, WpViewport},
     wp_viewporter::{self, WpViewporter},
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::{self, ZxdgOutputManagerV1},
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
 };
+
+const XDG_OUTPUT_MANAGER: &str = "zxdg_output_manager_v1";
+const XDG_OUTPUT_VERSION: u32 = 3;
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
     fn event(
@@ -59,6 +66,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                 "wp_viewporter" => {
                     state.viewporter = Some(registry.bind::<WpViewporter, _, _>(name, 1, qh, ()));
                 }
+                XDG_OUTPUT_MANAGER => {
+                    state.xdg_output_manager = Some(registry.bind::<ZxdgOutputManagerV1, _, _>(
+                        name,
+                        version.min(XDG_OUTPUT_VERSION),
+                        qh,
+                        (),
+                    ));
+                }
                 "wp_content_type_manager_v1" => {
                     state.content_type_manager =
                         Some(registry.bind::<WpContentTypeManagerV1, _, _>(name, 1, qh, ()));
@@ -85,7 +100,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                 "wl_output" => {
                     let out =
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
-                    state.outputs.push((out, String::new(), 1, (0, 0)));
+                    state.outputs.push(OutputInfo {
+                        output: out,
+                        name: String::new(),
+                        scale: 1,
+                        mode: (0, 0),
+                        geometry_position: None,
+                        logical_position: None,
+                        xdg_output: None,
+                    });
                 }
                 "ext_idle_notifier_v1" => {
                     state.idle_notifier =
@@ -112,17 +135,17 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
     ) {
         match event {
             wl_output::Event::Name { name } => {
-                for (out, stored, ..) in &mut state.outputs {
-                    if out.id() == output.id() {
-                        stored.clone_from(&name);
-                    }
+                if let Some(info) =
+                    state.outputs.iter_mut().find(|info| info.output.id() == output.id())
+                {
+                    info.name = name;
                 }
             }
             wl_output::Event::Scale { factor } => {
-                for (out, _, scale, _) in &mut state.outputs {
-                    if out.id() == output.id() {
-                        *scale = factor.max(1);
-                    }
+                if let Some(info) =
+                    state.outputs.iter_mut().find(|info| info.output.id() == output.id())
+                {
+                    info.scale = factor.max(1);
                 }
             }
             wl_output::Event::Mode { flags, width, height, .. } => {
@@ -130,12 +153,52 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
                     && fl.contains(wl_output::Mode::Current)
                     && width > 0
                     && height > 0
+                    && let Some(info) =
+                        state.outputs.iter_mut().find(|info| info.output.id() == output.id())
                 {
-                    for (out, _, _, mode) in &mut state.outputs {
-                        if out.id() == output.id() {
-                            *mode = (width as u32, height as u32);
-                        }
-                    }
+                    info.mode = (width as u32, height as u32);
+                }
+            }
+            wl_output::Event::Geometry { x, y, .. } => {
+                state.set_output_position(output, (x, y), false)
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgOutputManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZxdgOutputManagerV1,
+        _: zxdg_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, usize> for App {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        index: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(info) = state.outputs.get(*index) else {
+            return;
+        };
+        let output = info.output.clone();
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                state.set_output_position(&output, (x, y), true);
+            }
+            zxdg_output_v1::Event::Name { name } => {
+                if state.outputs[*index].name.is_empty() {
+                    state.outputs[*index].name = name;
                 }
             }
             _ => {}
@@ -453,7 +516,7 @@ impl Dispatch<wl_buffer::WlBuffer, (usize, usize)> for App {
         if let wl_buffer::Event::Release = event
             && let Some(surf) = state.surfaces.get_mut(*si)
         {
-            surf.free_buffers.push(*bi);
+            surf.give_back(*bi);
         }
     }
 }

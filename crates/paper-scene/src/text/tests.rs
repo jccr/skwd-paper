@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn preset_text_binds() {
+    let project = serde_json::json!({"general":{"properties":{
+        "Caption":{"type":"textinput","value":"Selected caption"},
+        "notepad":{"type":"textinput","value":"First|Second"},
+        "heading":{"type":"text","value":"Settings heading"}
+    }}});
+    let mut scene = serde_json::json!({"objects":[
+        {"text":{"user":"caption","value":"Base caption"}},
+        {"text":{"user":"notepad","value":"-","script":"export function update(value){return thisLayer.text.toString().split('|').join('\\n');}"}},
+        {"text":{"user":"heading","value":"Base heading"}},
+        {"text":{"user":"missing","value":"Keep me"}}
+    ]});
+    bind_user_values(&mut scene, &project);
+    assert_eq!(scene["objects"][0]["text"]["value"], "Selected caption");
+    assert_eq!(scene["objects"][1]["text"]["value"], "First|Second");
+    assert!(scene["objects"][1]["text"]["script"].is_string());
+    assert_eq!(scene["objects"][2]["text"]["value"], "Base heading");
+    assert_eq!(scene["objects"][3]["text"]["value"], "Keep me");
+}
+
+#[test]
+fn notepad_lines() {
+    let project = serde_json::json!({"general":{"properties":{
+        "notepad":{"type":"textinput","value":"First|Second"}
+    }}});
+    let mut scene = serde_json::json!({"objects":[
+        {"id":1,"text":{"user":"notepad","value":"-","script":"export function update(value){return thisLayer.text.toString().split('|').join('\\n');}"}}
+    ]});
+    bind_user_values(&mut scene, &project);
+    let host =
+        crate::script::SceneScripts::load(&mut scene, &crate::model::Properties::new(), &project)
+            .unwrap()
+            .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(scene["objects"][0]["text"], "First\nSecond");
+}
+
+#[test]
+fn repeated_text_is_bounded() {
+    let selected = "界".repeat(MAX_TEXT_CHARS + 1);
+    let project = serde_json::json!({"general":{"properties":{
+        "caption":{"type":"textinput","value":selected}
+    }}});
+    let mut scene = serde_json::json!({"objects":[
+        {"text":{"user":"caption","value":"one"}},
+        {"text":{"user":"caption","value":"two"}}
+    ]});
+    bind_user_values(&mut scene, &project);
+    for object in scene["objects"].as_array().unwrap() {
+        let text = object["text"]["value"].as_str().unwrap();
+        assert_eq!(text.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(text.len(), "界".len() * MAX_TEXT_CHARS);
+    }
+}
+
+#[test]
+fn text_box_wraps() {
+    let object = serde_json::json!({"limitwidth":true,"maxwidth":7,"limitrows":true,"maxrows":2});
+    let limits = TextLimits::of(&object, &Properties::new());
+    let width = |line: &str| line.chars().count() as f32;
+    assert_eq!(wrap_text("One two three four", limits.width, limits.rows, width), "One two\nthree");
+    assert_eq!(wrap_text("界界界界界", Some(2.0), None, width), "界界\n界界\n界");
+    assert_eq!(wrap_text("ABCDE", Some(0.5), None, width), "A\nB\nC\nD\nE");
+    assert_eq!(wrap_text("ABCDE", Some(0.5), Some(2), width), "A\nB");
+    assert_eq!(wrap_text("A  B\nC D", Some(4.0), None, width), "A  B\nC D");
+    assert_eq!(wrap_text("A\nB\nC", None, Some(2), width), "A\nB");
+}
+
+#[test]
 fn malformed_fonts_and_invalid_sizes_are_rejected() {
     for bytes in [&[][..], &[0, 1, 0, 0][..], b"not a font".as_slice()] {
         assert!(Face::parse(bytes, 200.0).is_none());

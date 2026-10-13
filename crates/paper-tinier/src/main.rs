@@ -22,6 +22,7 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static FREEZE: Mutex<Option<String>> = Mutex::new(None);
+static MIRRORS: Mutex<Vec<paper_control::MirrorTarget>> = Mutex::new(Vec::new());
 static OUTPUTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 extern "C" fn stop_running(_: libc::c_int) {
@@ -198,6 +199,7 @@ fn start_control(paused: bool) -> Result<Arc<OwnedFd>, String> {
                 *FREEZE.lock().unwrap() = Some(path);
                 PAUSED.store(true, Ordering::Relaxed);
             }
+            CommandClass::Mirror(target) => MIRRORS.lock().unwrap().push(target),
             CommandClass::RetainOutputs(outputs) => *OUTPUTS.lock().unwrap() = Some(outputs),
             _ => return,
         }

@@ -1,13 +1,17 @@
+mod mirror;
+
 use crate::model::{BUFFER_COUNT, VideoInfo};
 use crate::running;
+use paper_runtime::shm::SharedMemory;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_shm,
     output::{OutputHandler, OutputState},
     registry::RegistryState,
-    shm::{Shm, ShmHandler, raw::RawPool},
+    shm::{Shm, ShmHandler},
 };
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
+use wayland_client::protocol::wl_shm_pool;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_shm};
 use wayland_client::{
@@ -17,6 +21,7 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 struct SurfaceState {
+    mirror: Option<mirror::Mirror>,
     name: String,
     output: Option<wl_output::WlOutput>,
     surface: WlSurface,
@@ -233,7 +238,8 @@ fn resolve_targets(
 }
 
 struct Buffers {
-    pool: RawPool,
+    pool: wl_shm_pool::WlShmPool,
+    memory: SharedMemory,
     handles: Vec<wl_buffer::WlBuffer>,
 }
 
@@ -243,8 +249,9 @@ impl Buffers {
             .frame_bytes
             .checked_mul(BUFFER_COUNT)
             .ok_or_else(|| "wl_shm buffer size overflowed".to_string())?;
-        let mut pool = RawPool::new(total, shm)
-            .map_err(|error| format!("wl_shm pool allocation failed: {error}"))?;
+        let memory = SharedMemory::new(total)
+            .map_err(|error| format!("wl_shm allocation failed: {error}"))?;
+        let pool = shm.wl_shm().create_pool(memory.as_fd(), total as i32, qh, ());
         let width = i32::try_from(video.width).map_err(|_| "video width exceeds i32")?;
         let height = i32::try_from(video.height).map_err(|_| "video height exceeds i32")?;
         let stride = i32::try_from(video.stride).map_err(|_| "video stride exceeds i32")?;
@@ -258,11 +265,11 @@ impl Buffers {
                 height,
                 stride,
                 wl_shm::Format::Xrgb8888,
-                index,
                 qh,
+                index,
             ));
         }
-        Ok(Self { pool, handles })
+        Ok(Self { pool, memory, handles })
     }
 }
 
@@ -271,6 +278,7 @@ impl Drop for Buffers {
         for handle in &self.handles {
             handle.destroy();
         }
+        self.pool.destroy();
     }
 }
 
@@ -280,6 +288,7 @@ pub struct Wallpaper {
     queue: EventQueue<App>,
     state: App,
     video: VideoInfo,
+    shown: Option<usize>,
 }
 
 impl Wallpaper {
@@ -326,6 +335,7 @@ impl Wallpaper {
             let viewport = viewporter.get_viewport(&surface, &qh, ());
             surface.commit();
             state.surfaces.push(SurfaceState {
+                mirror: None,
                 name,
                 output,
                 surface,
@@ -349,7 +359,7 @@ impl Wallpaper {
             return Err("Wayland surface closed before configuration".into());
         }
         let buffers = Buffers::allocate(&state.shm, &qh, video)?;
-        Ok(Self { buffers, connection, queue, state, video })
+        Ok(Self { buffers, connection, queue, state, video, shown: None })
     }
 
     pub fn output_sizes(&self) -> String {
@@ -381,10 +391,12 @@ impl Wallpaper {
 
     pub fn pixels_mut(&mut self, index: usize) -> &mut [u8] {
         let start = index * self.video.frame_bytes;
-        &mut self.buffers.pool.mmap()[start..start + self.video.frame_bytes]
+        &mut self.buffers.memory.bytes()[start..start + self.video.frame_bytes]
     }
 
     pub fn present(&mut self, index: usize) -> Result<(), String> {
+        self.shown = Some(index);
+        self.publish_mirrors(index);
         self.state.buffer_busy[index] = true;
         let width = i32::try_from(self.video.width).expect("validated video width fits i32");
         let height = i32::try_from(self.video.height).expect("validated video height fits i32");
@@ -409,8 +421,8 @@ impl Wallpaper {
     }
 
     pub fn wait_for_buffer(&mut self, index: usize) -> Result<bool, String> {
-        while self.alive() && self.state.buffer_busy[index] {
-            self.poll_dispatch(1000, None)?;
+        while self.alive() && (self.state.buffer_busy[index] || self.mirror_held(index)) {
+            self.poll_dispatch(mirror::HOLD_POLL_MS, None)?;
         }
         Ok(self.alive())
     }
@@ -440,6 +452,7 @@ impl Wallpaper {
     }
 
     fn dispatch(&mut self) -> Result<(), String> {
+        self.service_mirrors();
         self.queue
             .dispatch_pending(&mut self.state)
             .map_err(|error| format!("Wayland dispatch failed: {error}"))?;
@@ -465,13 +478,21 @@ impl Wallpaper {
             }
             Err(error) => return Err(format!("Wayland flush failed: {error}")),
         }
-        let mut descriptors = [
+        let mut descriptors = vec![
             libc::pollfd { fd: read_guard.connection_fd().as_raw_fd(), events, revents: 0 },
             libc::pollfd { fd: wake_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
         ];
-        let count = if wake_fd.is_some() { 2 } else { 1 };
-        let result =
-            unsafe { libc::poll(descriptors.as_mut_ptr(), count as libc::nfds_t, timeout_ms) };
+        let count = descriptors.len();
+        descriptors.extend(
+            self.state
+                .surfaces
+                .iter()
+                .filter_map(|surface| surface.mirror.as_ref())
+                .map(|mirror| libc::pollfd { fd: mirror.fd(), events: libc::POLLIN, revents: 0 }),
+        );
+        let result = unsafe {
+            libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, timeout_ms)
+        };
         if result < 0 {
             let error = std::io::Error::last_os_error();
             drop(read_guard);
@@ -509,3 +530,15 @@ impl Wallpaper {
 }
 
 mod tests;
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &wl_shm_pool::WlShmPool,
+        _: wl_shm_pool::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}

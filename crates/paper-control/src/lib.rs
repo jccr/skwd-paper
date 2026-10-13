@@ -34,4 +34,4 @@ pub use socket::{
     signal_paper_ready_generation_to, signal_paper_ready_to, socket_path,
 };
 pub use stdin_reader::spawn_stdin_line_reader;
-pub use still_command::StillCommand;
+pub use still_command::{MirrorTarget, StillCommand};

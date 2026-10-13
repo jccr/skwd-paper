@@ -5,6 +5,13 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+const SCENE_TEXTURE_KIND: &str = "scenetexture";
+const PRESET_FIELD: &str = "preset";
+const SCENE_TEXTURE_TYPE_FIELD: &str = "type";
+const SCENE_TEXTURE_VALUE_FIELD: &str = "value";
+const GENERAL_FIELD: &str = "general";
+const PROPERTIES_FIELD: &str = "properties";
+
 fn confined_path(root: &Path, relative: &str) -> Option<PathBuf> {
     let relative = Path::new(relative);
     if relative.components().any(|component| {
@@ -35,6 +42,7 @@ pub(crate) fn read_confined_bytes(root: &Path, relative: &str, max: usize) -> Op
 
 pub struct Assets {
     root: Option<PathBuf>,
+    scene_textures: BTreeMap<String, (PathBuf, String)>,
     pub(crate) system_fonts: std::sync::Mutex<crate::text::system_font::Cache>,
     pub properties: BTreeMap<String, Vec<f32>>,
     property_dependencies: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
@@ -120,6 +128,7 @@ impl Assets {
             .and_then(|path| std::fs::canonicalize(path).ok());
         Self {
             root,
+            scene_textures: BTreeMap::new(),
             system_fonts: std::sync::Mutex::default(),
             properties: BTreeMap::new(),
             property_dependencies: std::sync::Mutex::new(Some(std::collections::BTreeSet::new())),
@@ -136,6 +145,58 @@ impl Assets {
     pub fn with_overrides(mut self, overrides: BTreeMap<String, Vec<f32>>) -> Self {
         self.properties.extend(overrides);
         self
+    }
+
+    pub(crate) fn with_scene_textures(
+        mut self,
+        document: &Value,
+        source: &Path,
+        directories: &[PathBuf],
+    ) -> std::io::Result<Self> {
+        let Some(declarations) = document
+            .get(GENERAL_FIELD)
+            .and_then(|general| general.get(PROPERTIES_FIELD))
+            .and_then(Value::as_object)
+        else {
+            return Ok(self);
+        };
+        let declarations: Vec<_> = declarations
+            .iter()
+            .filter(|(_, entry)| {
+                entry.get(SCENE_TEXTURE_TYPE_FIELD).and_then(Value::as_str)
+                    == Some(SCENE_TEXTURE_KIND)
+            })
+            .collect();
+        if declarations.is_empty() {
+            return Ok(self);
+        }
+        let documents = directories
+            .iter()
+            .map(|dir| paper_control::we_project::read(dir).map(|document| (dir, document)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for (name, entry) in declarations {
+            let Some(path) = entry
+                .get(SCENE_TEXTURE_VALUE_FIELD)
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+            let root = documents
+                .iter()
+                .find(|(_, document)| {
+                    document.get(PRESET_FIELD).and_then(|preset| preset.get(name)).is_some()
+                })
+                .map_or(source, |(dir, _)| dir.as_path());
+            self.scene_textures
+                .insert(name.to_ascii_lowercase(), (root.to_path_buf(), path.to_owned()));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn scene_texture_bytes(&self, name: &str, max: usize) -> Option<Vec<u8>> {
+        let (root, path) = self.scene_textures.get(&name.to_ascii_lowercase())?;
+        read_confined_bytes(root, path, max)
     }
 
     pub(crate) fn root(&self) -> Option<&Path> {

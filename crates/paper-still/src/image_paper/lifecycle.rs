@@ -53,7 +53,7 @@ pub fn run(
 
     let transparent = if std::env::var("SKWD_PAPER_PREPARE_HIDDEN").as_deref() == Ok("1") {
         anyhow::ensure!(persist, "hidden preparation requires persistent control");
-        Some(BufferSet::new(&shm, 1, 1, 0, |canvas, _| canvas.fill(0))?)
+        Some(BufferSet::new(&shm, &qh, 1, 1, 0, |canvas, _| canvas.fill(0))?)
     } else {
         None
     };
@@ -130,11 +130,17 @@ fn run_event_loop(
         };
         let _ = conn.flush();
 
-        let mut fds = [
+        let mirrors = app.mirror_fds();
+        let mut fds = vec![
             libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
         ];
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        fds.extend(mirrors.iter().map(|&(_, fd)| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -156,6 +162,11 @@ fn run_event_loop(
         }
         if (fds[1].revents & libc::POLLIN) != 0 {
             wake.drain();
+        }
+        for (slot, &(index, _)) in mirrors.iter().enumerate() {
+            if fds[2 + slot].revents != 0 {
+                app.service_mirror(index);
+            }
         }
     }
 }
@@ -263,6 +274,8 @@ impl App {
             attached: false,
             span_pool: None,
             span_keepalive: None,
+            shown: None,
+            mirror: None,
         });
     }
 
@@ -288,9 +301,10 @@ impl App {
         };
         let (bw, bh, pixels) = apply_fill_mode(raw_w, raw_h, &raw, surf_w, surf_h, self.fill_mode);
         drop(raw);
-        let buffer = BufferSet::new(&self.shm, bw, bh, self.surfaces.len(), |canvas, format| {
-            pack_pixels(canvas, &pixels, format);
-        })?;
+        let buffer =
+            BufferSet::new(&self.shm, &self.qh, bw, bh, self.surfaces.len(), |canvas, format| {
+                pack_pixels(canvas, &pixels, format);
+            })?;
         self.buffers.insert((surf_w, surf_h), buffer);
         Ok(true)
     }
@@ -329,11 +343,9 @@ impl App {
         let surf = &mut self.surfaces[idx];
         surf.viewport.set_source(0.0, 0.0, 1.0, 1.0);
         surf.viewport.set_destination(surf.width as i32, surf.height as i32);
-        if let Err(err) = buffer.attach_to(idx, &surf.surface) {
-            tracing::error!(error = %err, "attach prepared surface failed");
-            return;
-        }
+        buffer.attach_to(idx, &surf.surface);
         surf.surface.damage_buffer(0, 0, 1, 1);
+        surf.hide();
         surf.attached = true;
         surf.surface.commit();
         self.startup_readiness.committed(surf.output.id().protocol_id());
@@ -394,13 +406,11 @@ impl App {
             let Some(buffer) = self.buffers.get_mut(&(sw, sh)) else {
                 return;
             };
-            if let Err(err) = buffer.attach_to(attach_idx, &surf.surface) {
-                tracing::error!(error = %err, "attach buffer failed");
-                return;
-            }
+            buffer.attach_to(attach_idx, &surf.surface);
             surf.surface.damage_buffer(0, 0, bw as i32, bh as i32);
             surf.attached = true;
             surf.surface.commit();
+            surf.show(buffer, super::mirror::full(bw, bh));
             self.startup_readiness.committed(surf.output.id().protocol_id());
         }
         if let Some(buffer) = self.buffers.get_mut(&(sw, sh)) {

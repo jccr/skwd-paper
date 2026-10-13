@@ -24,9 +24,10 @@ impl App {
         }
         let (rw, rh, raw) = decode_image(path, self.blur, self.dim)?;
         let (bw, bh, pixels) = apply_fill_mode(rw, rh, &raw, sw, sh, self.fill_mode);
-        let buffer = BufferSet::new(&self.shm, bw, bh, self.surfaces.len(), |canvas, format| {
-            pack_pixels(canvas, &pixels, format);
-        })?;
+        let buffer =
+            BufferSet::new(&self.shm, &self.qh, bw, bh, self.surfaces.len(), |canvas, format| {
+                pack_pixels(canvas, &pixels, format);
+            })?;
         Ok(ReadyBuffer { buffer, for_w: sw, for_h: sh })
     }
 
@@ -114,12 +115,10 @@ impl App {
             }
             surf.viewport.set_source(0.0, 0.0, f64::from(w), f64::from(h));
             surf.viewport.set_destination(surf.width as i32, surf.height as i32);
-            if let Err(err) = ready.buffer.attach_to(idx, &surf.surface) {
-                tracing::error!(error = %err, "attach cached buffer failed");
-                return false;
-            }
+            ready.buffer.attach_to(idx, &surf.surface);
             surf.surface.damage_buffer(0, 0, w as i32, h as i32);
             surf.surface.commit();
+            surf.show(&ready.buffer, super::mirror::full(w, h));
         }
         self.retire_current();
         self.path = path.to_string();
@@ -173,15 +172,16 @@ impl App {
             return false;
         }
         let dir_up = dir != "down";
-        let buffer = match BufferSet::new(&self.shm, w, h * 2, self.surfaces.len(), |canvas, _| {
-            compose_tall(canvas, &old_bytes, &new_bytes, dir_up);
-        }) {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                tracing::warn!(error = %err, "slide: tall pool failed");
-                return false;
-            }
-        };
+        let buffer =
+            match BufferSet::new(&self.shm, &self.qh, w, h * 2, self.surfaces.len(), |canvas, _| {
+                compose_tall(canvas, &old_bytes, &new_bytes, dir_up);
+            }) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    tracing::warn!(error = %err, "slide: tall pool failed");
+                    return false;
+                }
+            };
         let y0 = slide_source_y(dir_up, h, 0.0);
         let qh = self.qh.clone();
         let mut buffer = buffer;
@@ -191,15 +191,13 @@ impl App {
             }
             surf.viewport.set_source(0.0, y0, f64::from(w), f64::from(h));
             surf.viewport.set_destination(surf.width as i32, surf.height as i32);
-            if let Err(err) = buffer.attach_to(idx, &surf.surface) {
-                tracing::warn!(error = %err, "slide: attach buffer failed");
-                return false;
-            }
+            buffer.attach_to(idx, &surf.surface);
             surf.surface.damage_buffer(0, 0, w as i32, (h * 2) as i32);
             if idx == 0 {
                 surf.surface.frame(&qh, surf.surface.clone());
             }
             surf.surface.commit();
+            surf.show(&buffer, [0, y0 as u32, w, h]);
         }
         tracing::info!(
             path = %path, dir = %dir, duration_ms,
@@ -240,6 +238,7 @@ impl App {
                 surf.surface.frame(&qh, surf.surface.clone());
             }
             surf.surface.commit();
+            surf.move_source([0, y.round() as u32, w, h]);
         }
     }
 
@@ -278,6 +277,10 @@ impl App {
     }
 
     fn consume_command(&mut self, cmd: &paper_control::StillCommand) {
+        if let Some(target) = &cmd.mirror {
+            self.set_mirror(target);
+            return;
+        }
         if let Some(surface) = &cmd.surface
             && let Err(error) = self.set_surface_effects(surface)
         {
