@@ -248,7 +248,7 @@ impl Renderer {
                 anyhow!("no suitable Vulkan device (need dmabuf import + wayland present)")
             })?;
 
-            let mut dev_exts: Vec<*const i8> =
+            let mut dev_exts: Vec<*const std::ffi::c_char> =
                 required_dev_exts.iter().map(|name| name.as_ptr()).collect();
             if has_foreign {
                 dev_exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());

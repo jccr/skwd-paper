@@ -472,7 +472,7 @@ fn create_with_policy(
                 wanted_device_extension(name)
             })
             .collect();
-        let ext_ptrs: Vec<*const i8> = ext_names.iter().map(|cname| cname.as_ptr()).collect();
+        let ext_ptrs: Vec<*const std::ffi::c_char> = ext_names.iter().map(|cname| cname.as_ptr()).collect();
         let foreign_queue =
             ext_names.iter().any(|name| name.as_c_str() == ash::ext::queue_family_foreign::NAME);
 
@@ -546,10 +546,10 @@ fn create_with_policy(
             CString::new("VK_KHR_wayland_surface").unwrap(),
             CString::new("VK_KHR_get_physical_device_properties2").unwrap(),
         ]);
-        let inst_ext_ptrs: &'static [*const i8] =
+        let inst_ext_ptrs: &'static [*const std::ffi::c_char] =
             Vec::leak(inst_ext_names.iter().map(|cname| cname.as_ptr()).collect());
         let dev_ext_names: &'static [CString] = Vec::leak(ext_names);
-        let dev_ext_ptrs: &'static [*const i8] =
+        let dev_ext_ptrs: &'static [*const std::ffi::c_char] =
             Vec::leak(dev_ext_names.iter().map(|cname| cname.as_ptr()).collect());
 
         let queue_for = |required: vk::QueueFlags| {
