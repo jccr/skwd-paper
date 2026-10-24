@@ -1,0 +1,117 @@
+name: Arch package
+
+# A push to the packaging branch builds both packages as workflow artifacts
+# only; a v* tag (v<version>-<pkgrel>, e.g. v1.0.0-beta.23-1) also publishes
+# them with SHA256SUMS on the tag's release.
+on:
+  push:
+    branches: [aarch64-arch-release]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Arch Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: docker.io/menci/archlinuxarm:latest
+    env:
+      PKGEXT: .pkg.tar.zst
+      PACKAGER: jccr/skwd-paper GitHub Actions
+    steps:
+    - name: Prepare pacman
+      run: |
+        # pacman's Landlock sandbox cannot start inside the job container.
+        grep -q '^DisableSandbox' /etc/pacman.conf ||
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+        pacman-key --init
+        pacman-key --populate
+        pacman -Syu --noconfirm --needed base-devel git file
+
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      working-directory: packaging/arch
+      run: |
+        deps=$(bash -c 'source ./PKGBUILD; printf "%s\n" "${depends[@]}" "${makedepends[@]}"')
+        pacman -S --noconfirm --needed $deps
+        useradd --create-home builder
+        chown -R builder: "$GITHUB_WORKSPACE"
+
+    - name: Build package
+      working-directory: packaging/arch
+      run: runuser -u builder -- env PKGEXT="$PKGEXT" PACKAGER="$PACKAGER" makepkg --noconfirm
+
+    - name: Check package
+      working-directory: packaging/arch
+      run: |
+        set -euo pipefail
+        pkg=$(ls skwd-paper-*-${{ matrix.arch }}.pkg.tar.zst)
+        bsdtar -xOf "$pkg" .PKGINFO
+        bsdtar -tvf "$pkg"
+        mkdir check && bsdtar -xf "$pkg" -C check usr
+        machine=$(case ${{ matrix.arch }} in x86_64) echo x86-64 ;; aarch64) echo aarch64 ;; esac)
+        for elf in check/usr/bin/* check/usr/lib/skwd-paper/*; do
+          [ -L "$elf" ] && continue
+          file -b "$elf" | tee /dev/stderr | grep -q "ELF 64-bit.*$machine"
+        done
+        for lib in libavcodec.so.63 libavformat.so.63 libavutil.so.61 libswresample.so.7 libswscale.so.10; do
+          test -e "check/usr/lib/skwd-paper/$lib"
+        done
+        echo "PACKAGE=$pkg" >> "$GITHUB_ENV"
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: skwd-paper-${{ matrix.arch }}
+        path: packaging/arch/${{ env.PACKAGE }}
+        if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check tag against the PKGBUILD
+      run: |
+        expected=$(bash -c 'source packaging/arch/PKGBUILD; echo "v${pkgver//_/-}-$pkgrel"')
+        if [ "$TAG" != "$expected" ]; then
+          echo "tag $TAG does not match the PKGBUILD ($expected)" >&2
+          exit 1
+        fi
+
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: skwd-paper-*
+        path: dist
+        merge-multiple: true
+
+    - name: Publish release
+      working-directory: dist
+      run: |
+        sha256sum *.pkg.tar.zst > SHA256SUMS
+        cat SHA256SUMS
+        if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "skwd-paper $TAG" \
+            --notes "Arch Linux packages of skwd-paper for x86_64 and aarch64, built from $GITHUB_SHA."
+        fi
+        gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.pkg.tar.zst SHA256SUMS
