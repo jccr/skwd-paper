@@ -1,0 +1,80 @@
+# Builds skwd-paper alone from the commit checked out around this file, for
+# x86_64 and aarch64. Adapted from package_skwd-paper in the upstream AUR
+# skwd-wall-v2 recipe (distribution/build.sh paper + install.sh paper of the
+# skwd-suite source archive), whose x86_64 package layout it reproduces.
+#
+#   cd packaging/arch && makepkg -s
+pkgname=skwd-paper
+pkgver=1.0.0_beta.23
+pkgrel=1
+pkgdesc='Still, video, and Wallpaper Engine renderers for Skwd'
+arch=(x86_64 aarch64)
+url='https://github.com/liixini/skwd-wall/tree/v2'
+license=(GPL-3.0-or-later)
+depends=(alsa-lib dav1d gcc-libs libdrm libglvnd libpulse libva libxkbcommon
+         libyuv shaderc vulkan-icd-loader wayland zlib)
+makedepends=(cargo clang gcc lld pkgconf curl git nasm patchelf
+             shaderc vulkan-headers vulkan-icd-loader wayland wayland-protocols)
+options=(!debug !lto)
+_ffmpeg_version=9.0.1
+source=("https://ffmpeg.org/releases/ffmpeg-$_ffmpeg_version.tar.xz")
+noextract=("ffmpeg-$_ffmpeg_version.tar.xz")
+sha256sums=('cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635')
+
+_tree=skwd-paper
+
+prepare() {
+  rm -rf "$_tree"
+  mkdir "$_tree"
+  git -C "$startdir/../.." archive --format=tar HEAD | bsdtar -xf - -C "$_tree"
+  cd "$_tree"
+  local version
+  version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+  if [[ ${version//-/_} != "$pkgver" ]]; then
+    echo "pkgver $pkgver does not match the workspace version $version" >&2
+    return 1
+  fi
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$_tree"
+  local ffmpeg="$PWD/.skwd-package/ffmpeg" triple
+  SKWD_FFMPEG_TARBALL="$srcdir/ffmpeg-$_ffmpeg_version.tar.xz" \
+    ./packaging/build-ffmpeg-runtime.sh "$ffmpeg"
+
+  triple=$(rustc -vV | sed -n 's/^host: //p')
+  triple=${triple^^}
+  export "CARGO_TARGET_${triple//-/_}_LINKER=$PWD/packaging/link-private-ffmpeg.sh"
+  export SKWD_FFMPEG_PREFIX="$ffmpeg"
+  export FFMPEG_DIR="$ffmpeg"
+  export PKG_CONFIG_PATH="$ffmpeg/lib/pkgconfig"
+  export CARGO_PROFILE_RELEASE_STRIP=symbols
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-fuse-ld=lld --remap-path-prefix=$PWD=/usr/src/skwd-paper"
+  cargo build --frozen --release \
+    --package skwd-paper \
+    --package paper-tinier \
+    --package skwd-wall-vk \
+    --package skwd-wall-still
+}
+
+package() {
+  cd "$_tree"
+  local bin=target/release ffmpeg=.skwd-package/ffmpeg
+  local licenses="$pkgdir/usr/share/licenses/$pkgname"
+
+  install -Dm755 "$bin/skwd-paper" "$pkgdir/usr/bin/skwd-paper-v2"
+  install -Dm755 -t "$pkgdir/usr/bin" "$bin/skwd-wall-still" "$bin/skwd-wall-vk"
+  install -Dm755 -t "$pkgdir/usr/lib/skwd-paper" "$bin/skwd-paper-tinier"
+
+  # cp -a keeps each soname a symlink beside its versioned library.
+  cp -a "$ffmpeg"/lib/*.so.* "$pkgdir/usr/lib/skwd-paper/"
+  find "$pkgdir/usr/lib/skwd-paper" -maxdepth 1 -type f -name '*.so.*' -exec chmod 755 {} +
+
+  install -Dm644 LICENSE "$licenses/LICENSE"
+  install -d "$licenses/third-party" "$licenses/ffmpeg"
+  cp -a LICENSES/. "$licenses/third-party/"
+  # FFmpeg ships under the LGPL, so its license and exact source travel with it.
+  cp -a "$ffmpeg/share/licenses/ffmpeg/." "$licenses/ffmpeg/"
+  find "$licenses" -type f -exec chmod 644 {} +
+}
